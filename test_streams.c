@@ -87,6 +87,17 @@ int main(void)
             CHECK(memory[(0x800+4*routes[i].slot)/4]==smr && memory[(0xc00+4*routes[i].slot)/4]==s2cr);
         }
         unsigned writes=f.writes;CHECK(!ArmSmmu4KObserveStreams(&io,&state,&config,&result) && f.writes==writes);
+        const unsigned full_reads=result.reads;
+        CHECK(!ArmSmmu4KObserveOwnedStreams(&io,&state,&config,&result) && f.writes==writes && result.streams_verified==2);
+        CHECK(result.reads==3+2*2 && result.reads<full_reads && result.context.enabled);
+        /* Every read or barrier failing is an I/O error, never a pass. */
+        for(unsigned at=1;;++at) {
+            f.calls=0;f.fail_call=at;
+            const ArmSmmu4KStatus st=ArmSmmu4KObserveOwnedStreams(&io,&state,&config,&result);
+            if(!st){CHECK(at>1);break;}
+            CHECK(st==ArmSmmu4KIoError && f.writes==writes);++fault_cases;
+        }
+        f.fail_call=0;f.calls=0;
         CHECK(attach()==ArmSmmu4KBusy && f.writes==writes);
         CHECK(!ArmSmmu4KFaultStreams(&io,&state,&result) && !state.attached && !state.poisoned && result.streams_faulted==2 && result.must_retain_resources);
         isolated(exid);
@@ -129,6 +140,15 @@ int main(void)
         CHECK(!ArmSmmu4KCheckFaultedStreams(&io,routes,2,2,&result) && !f.writes);
         CHECK(!attach());writes=f.writes;memory[0xc08/4]^=1;
         CHECK(ArmSmmu4KObserveStreams(&io,&state,&config,&result)==ArmSmmu4KStateMismatch && f.writes==writes);
+        CHECK(ArmSmmu4KObserveOwnedStreams(&io,&state,&config,&result)==ArmSmmu4KStateMismatch && f.writes==writes);
+        memory[0xc08/4]^=1;memory[0x810/4]^=1;
+        CHECK(ArmSmmu4KObserveOwnedStreams(&io,&state,&config,&result)==ArmSmmu4KStateMismatch && f.writes==writes);
+        memory[0x810/4]^=1;memory[0]|=1;
+        CHECK(ArmSmmu4KObserveOwnedStreams(&io,&state,&config,&result)==ArmSmmu4KStateMismatch && f.writes==writes);
+        memory[0]&=~1u;memory[CB/4]&=~1u;
+        CHECK(ArmSmmu4KObserveOwnedStreams(&io,&state,&config,&result)!=ArmSmmu4KSuccess && f.writes==writes);
+        memory[CB/4]|=1u;CHECK(!ArmSmmu4KObserveOwnedStreams(&io,&state,&config,&result));
+        memory[0xc08/4]^=1;
         CHECK(ArmSmmu4KFaultStreams(&io,&state,&result)==ArmSmmu4KStateMismatch && f.writes==writes);
     }
     printf("PASS: legacy/EXIDS stream attachment and quarantine, %u per-call I/O failure cases, 32 pre-write refusals, 2 attachments without GCFGFRE/GCFGFIE, actual context readback and unrelated-route isolation (software registers only)\n",fault_cases);

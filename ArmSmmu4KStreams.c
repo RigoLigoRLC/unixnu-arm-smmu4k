@@ -96,6 +96,23 @@ ArmSmmu4KStatus ArmSmmu4KObserveStreams(const ArmSmmu4KIo *io,const ArmSmmu4KStr
     if(!s || !s->attached || s->poisoned || !s->count || s->count>8)return ArmSmmu4KArgument;
     return observe(io,s,c,r);
 }
+ArmSmmu4KStatus ArmSmmu4KObserveOwnedStreams(const ArmSmmu4KIo *io,const ArmSmmu4KStreamState *s,
+    const ArmSmmu4KContextConfig *c,ArmSmmu4KStreamResult *r)
+{
+    if(!r)return ArmSmmu4KArgument;
+    *r=(ArmSmmu4KStreamResult){0};r->must_retain_resources=1;
+    if(!s || !s->attached || s->poisoned || !s->count || s->count>8)return ArmSmmu4KArgument;
+    ArmSmmu4KStatus status=global(io,r);if(status)return status;
+    if(r->id0!=s->id0 || r->scr0!=s->scr0)return ArmSmmu4KStateMismatch;
+    status=ArmSmmu4KObserveOwnedContext(io,s->bank,c,&r->context);if(status)return status;
+    for(unsigned i=0;i<s->count;++i) {
+        uint32_t smr,s2cr;
+        if(rd(io,0x800+4*s->streams[i].slot,&smr,r) || rd(io,0xc00+4*s->streams[i].slot,&s2cr,r))return ArmSmmu4KIoError;
+        if(smr!=(valid_smr(r->id0)|s->streams[i].sid) || s2cr!=(s->bank|valid_s2cr(r->id0)))return ArmSmmu4KStateMismatch;
+        ++r->streams_verified;
+    }
+    return io->barrier(io->cookie)?ArmSmmu4KIoError:ArmSmmu4KSuccess;
+}
 ArmSmmu4KStatus ArmSmmu4KAttachStreams(const ArmSmmu4KIo *io,ArmSmmu4KStreamState *state,
     const ArmSmmu4KStream *s,unsigned n,unsigned bank,const ArmSmmu4KContextConfig *c,ArmSmmu4KStreamResult *r)
 {

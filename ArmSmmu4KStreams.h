@@ -45,6 +45,13 @@ ArmSmmu4KStatus ArmSmmu4KAttachStreams(const ArmSmmu4KIo *,ArmSmmu4KStreamState 
  * enabled native4K context image. No fault clear or recovery is synthesized. */
 ArmSmmu4KStatus ArmSmmu4KObserveStreams(const ArmSmmu4KIo *,const ArmSmmu4KStreamState *,
     const ArmSmmu4KContextConfig *,ArmSmmu4KStreamResult *);
+/* Read-only, the global fault policy, the complete enabled native4K context
+ * image and the exact owned routes, without the scan of every other slot for
+ * conflicting routes: a fixed read count however many slots the SMMU has. A
+ * route another agent added later is only seen by ArmSmmu4KObserveStreams,
+ * which a caller observing this way must still run at a bounded interval. */
+ArmSmmu4KStatus ArmSmmu4KObserveOwnedStreams(const ArmSmmu4KIo *,const ArmSmmu4KStreamState *,
+    const ArmSmmu4KContextConfig *,ArmSmmu4KStreamResult *);
 /* Require exact owned active routes before changing them to FAULT. SMRs stay
  * valid, so those SIDs remain blocked. Does not drain transactions/TLBs, stop
  * devices, disable context, release ownership or authorize freeing tables.
