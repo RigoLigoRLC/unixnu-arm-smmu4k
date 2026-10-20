@@ -53,6 +53,11 @@ ArmSmmu4KStatus ArmSmmu4KObserveOwnedContext(const ArmSmmu4KIo *,unsigned bank,
  * Any failure retains all mappings/resources; success is not a GPU fence. */
 ArmSmmu4KStatus ArmSmmu4KSynchronizeOwnedContext(const ArmSmmu4KIo *,unsigned bank,
     const ArmSmmu4KContextConfig *,unsigned poll_budget,ArmSmmu4KProgramResult *);
+/* TLBIASID (or, with all set, TLBIALL) and the bounded TLBSYNC of the context bank at context_offset alone: no image or fault
+ * observation. For a caller that observed this owned bank's image at that offset already and keeps it owned (the live updater
+ * between its whole-verification updates). */
+ArmSmmu4KStatus ArmSmmu4KSyncContextTlb(const ArmSmmu4KIo *,uint64_t context_offset,unsigned asid,unsigned all,
+    unsigned poll_budget,ArmSmmu4KProgramResult *);
 /* As ArmSmmu4KSynchronizeOwnedContext, but with TLBIALL for the bank instead of TLBIASID: every cached translation of the bank goes,
  * whatever ASID it was tagged with. */
 ArmSmmu4KStatus ArmSmmu4KInvalidateAllOwnedContext(const ArmSmmu4KIo *,unsigned bank,

@@ -279,7 +279,7 @@ ArmSmmu4KStatus ArmSmmu4KLivePrepare(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveSt
     size_t next=1;
     status=walk(a,&shape,shape.start_level,0,0,&next,1,0,0,0,0,0,0);
     if(status!=ArmSmmu4KSuccess || next!=shape.table_pages) {state->poisoned=1;return ArmSmmu4KStateMismatch;}
-    state->tables=shape;state->generation=0;state->prepared=1;
+    state->tables=shape;state->generation=0;state->prepared=1;state->context_offset=0;
     return ArmSmmu4KSuccess;
 }
 static int same_config(const ArmSmmu4KConfig *a,const ArmSmmu4KConfig *b)
@@ -429,8 +429,14 @@ static ArmSmmu4KStatus update(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *st
         uint64_t va=changes[i].iova+offset,old=expected(before,count,va);
         if(map?old!=0:old!=descriptor(&changes[i],va))return ArmSmmu4KStateMismatch;
     }
-    status=ArmSmmu4KObserveOwnedContext(io,bank,context,&r->synchronization);
-    if(status!=ArmSmmu4KSuccess)goto poisoned;
+    /* The context image and faults are observed around the stores of the whole-verification updates only (every 64th, the first
+     * included), and remembered there. Between them the bank stays the caller's exclusively owned one; each of these reads is a
+     * device register access, and an update observed it five times (int-159: 1.1 ms of a 1.7 ms buffer map). */
+    const int observed=whole || !state->context_offset;
+    if(observed) {
+        status=ArmSmmu4KObserveOwnedContext(io,bank,context,&r->synchronization);
+        if(status!=ArmSmmu4KSuccess)goto poisoned;
+    }
     if(whole) {
         status=verify(a,&shape,before,count,0,0,0,r);if(status!=ArmSmmu4KSuccess)goto poisoned;
         if(peer) {
@@ -440,12 +446,14 @@ static ArmSmmu4KStatus update(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *st
     } else {
         status=verify_changed(a,&shape,changes,change_count,map,0,r);if(status!=ArmSmmu4KSuccess)goto poisoned;
     }
-    ArmSmmu4KProgramResult initial=r->synchronization;
-    status=ArmSmmu4KObserveOwnedContext(io,bank,context,&r->synchronization);
-    if(status!=ArmSmmu4KSuccess)goto poisoned;
-    if(initial.id0!=r->synchronization.id0 || initial.id1!=r->synchronization.id1 ||
-        initial.id2!=r->synchronization.id2 || initial.context_offset!=r->synchronization.context_offset)
-        {status=ArmSmmu4KStateMismatch;goto poisoned;}
+    if(observed) {
+        ArmSmmu4KProgramResult initial=r->synchronization;
+        status=ArmSmmu4KObserveOwnedContext(io,bank,context,&r->synchronization);
+        if(status!=ArmSmmu4KSuccess)goto poisoned;
+        if(initial.id0!=r->synchronization.id0 || initial.id1!=r->synchronization.id1 ||
+            initial.id2!=r->synchronization.id2 || initial.context_offset!=r->synchronization.context_offset)
+            {status=ArmSmmu4KStateMismatch;goto poisoned;}
+    }
     /* All validation precedes the first store. Caller keeps every master
      * quiesced and retains both old/new object references through this call. */
     for(size_t i=0;i<change_count;++i)for(uint64_t offset=0;offset<changes[i].bytes;offset+=PAGE) {
@@ -464,8 +472,15 @@ static ArmSmmu4KStatus update(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *st
             ++r->published_pages;last_page=page;
         }
     }
-    status=ArmSmmu4KSynchronizeOwnedContext(io,bank,context,budget,&r->synchronization);
-    if(status!=ArmSmmu4KSuccess)goto poisoned;
+    /* A map of leaves that were invalid needs no TLB invalidation: the TLBs hold no translation of an invalid descriptor (as Linux's
+     * io-pgtable maps without one). The unmap invalidates the ASID before it reports the translation removed. */
+    if(observed) {
+        status=ArmSmmu4KSynchronizeOwnedContext(io,bank,context,budget,&r->synchronization);
+        if(status!=ArmSmmu4KSuccess)goto poisoned;
+    } else if(!map) {
+        status=ArmSmmu4KSyncContextTlb(io,state->context_offset,context->asid,0,budget,&r->synchronization);
+        if(status!=ArmSmmu4KSuccess)goto poisoned;
+    }
     if(whole) {
         status=verify(a,&shape,before,count,changes,change_count,map,r);if(status!=ArmSmmu4KSuccess)goto poisoned;
         if(peer) {
@@ -475,11 +490,14 @@ static ArmSmmu4KStatus update(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *st
     } else {
         status=verify_changed(a,&shape,changes,change_count,map,1,r);if(status!=ArmSmmu4KSuccess)goto poisoned;
     }
-    ArmSmmu4KProgramResult after;
-    status=ArmSmmu4KObserveOwnedContext(io,bank,context,&after);if(status!=ArmSmmu4KSuccess)goto poisoned;
-    if(after.id0!=r->synchronization.id0 || after.id1!=r->synchronization.id1 ||
-        after.id2!=r->synchronization.id2 || after.context_offset!=r->synchronization.context_offset)
-        {status=ArmSmmu4KStateMismatch;goto poisoned;}
+    if(observed) {
+        ArmSmmu4KProgramResult after;
+        status=ArmSmmu4KObserveOwnedContext(io,bank,context,&after);if(status!=ArmSmmu4KSuccess)goto poisoned;
+        if(after.id0!=r->synchronization.id0 || after.id1!=r->synchronization.id1 ||
+            after.id2!=r->synchronization.id2 || after.context_offset!=r->synchronization.context_offset)
+            {status=ArmSmmu4KStateMismatch;goto poisoned;}
+        state->context_offset=r->synchronization.context_offset;
+    }
     state->tables.leaf_pages=map?leaves+changed:leaves-changed;++state->generation;
     r->complete=1;r->translation_removed=!map;r->must_retain_resources=0;
     return ArmSmmu4KSuccess;

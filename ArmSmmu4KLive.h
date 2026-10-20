@@ -20,6 +20,8 @@ typedef struct {
     ArmSmmu4KResult tables;
     uint64_t generation;
     unsigned prepared,poisoned;
+    /* The context bank's register offset the last whole-verification update observed its image at; 0 before the first. */
+    uint64_t context_offset;
 } ArmSmmu4KLiveState;
 typedef struct {
     void *cookie;

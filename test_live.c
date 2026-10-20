@@ -139,8 +139,12 @@ static ArmSmmu4KStatus update(const ArmSmmu4KRange *before,size_t count,const Ar
 static void complete(unsigned removed,size_t pages)
 {
     CHECK(result.complete && result.translation_removed==removed && !result.must_retain_resources);
-    CHECK(!state.poisoned && state.tables.leaf_pages==pages && result.synchronization.tlb_synchronized);
-    CHECK(f.tlbi_calls==1 && f.sync_calls==1 && f.synced && f.barriers>=4);
+    CHECK(!state.poisoned && state.tables.leaf_pages==pages);
+    /* A whole-verification update observes the context and synchronizes its ASID; between them an unmap synchronizes it alone and a
+     * map of invalid leaves needs neither. */
+    if(result.whole_verification)CHECK(result.synchronization.tlb_synchronized && f.tlbi_calls==1 && f.sync_calls==1 && f.synced && f.barriers>=4);
+    else if(removed)CHECK(result.synchronization.tlb_synchronized && f.tlbi_calls==1 && f.sync_calls==1 && f.synced && f.barriers>=3);
+    else CHECK(!result.synchronization.tlb_synchronized && !f.tlbi_calls && !f.sync_calls);
     /* A whole-region update reads every descriptor; the others read each changed leaf's path before and after the store. */
     CHECK(result.whole_verification?result.descriptor_reads>=state.tables.table_pages*1024:result.descriptor_reads>=2);
 }
@@ -169,10 +173,14 @@ static unsigned profiles(void)
 }
 static unsigned failures(void)
 {
-    setup(48,1,48,0,0x1ff000);ArmSmmu4KRange r=resource(2,3,1);
-    CHECK(update(0,0,&r,1)==ArmSmmu4KSuccess);size_t calls=f.calls;
+    ArmSmmu4KRange r;
     unsigned count=0;
-    for(unsigned unmap=0;unmap<2;++unmap)for(unsigned after=0;after<2;++after)
+    for(unsigned unmap=0;unmap<2;++unmap)for(unsigned after=0;after<2;++after) {
+    /* The device accesses of this update without a failure: the first map's (whole verification), the following unmap's (not). */
+    setup(48,1,48,0,0x1ff000);r=resource(2,3,1);
+    CHECK(update(0,0,&r,1)==ArmSmmu4KSuccess);
+    if(unmap) {reset_counters();CHECK(update(&r,1,&r,0)==ArmSmmu4KSuccess);}
+    const size_t calls=f.calls;CHECK(calls);
     for(size_t failed=1;failed<=calls;++failed) {
         setup(48,1,48,0,0x1ff000);r=resource(2,3,1);
         if(unmap) {CHECK(update(0,0,&r,1)==ArmSmmu4KSuccess);reset_counters();}
@@ -182,6 +190,7 @@ static unsigned failures(void)
         size_t old_calls=f.calls,old_writes=f.writes;
         CHECK(update(unmap?&r:0,unmap?1:0,&r,!unmap)==ArmSmmu4KArgument);
         CHECK(f.calls==old_calls && f.writes==old_writes);++count;
+    }
     }
     for(unsigned unmap=0;unmap<2;++unmap)for(unsigned fail=1;fail<=2;++fail) {
         setup(48,1,48,0,0x1ff000);r=resource(2,3,1);
@@ -309,9 +318,22 @@ static unsigned pair_failures(void)
 {
     setup_pair(48,48,0);ArmSmmu4KLiveRegion lo={&arena,&state,0,0},hi={&peer_arena,&peer_state,0,0};
     ArmSmmu4KRange l=resource(2,3,1);
-    CHECK(!pair_update(&lo,&hi,&l,0,1));size_t calls=f.calls;unsigned controls=0;
+    CHECK(!pair_update(&lo,&hi,&l,0,1));unsigned controls=0;
     for(unsigned upper=0;upper<2;++upper)for(unsigned unmap=0;unmap<2;++unmap)
-    for(unsigned after=0;after<2;++after)for(size_t failed=1;failed<=calls;++failed) {
+    for(unsigned after=0;after<2;++after) {
+    /* The device accesses of the update without a failure: a region's first map (whole verification) or the unmap after it (not). */
+    size_t calls;
+    {
+        setup_pair(48,48,0);
+        lo=(ArmSmmu4KLiveRegion){&arena,&state,0,0};hi=(ArmSmmu4KLiveRegion){&peer_arena,&peer_state,0,0};
+        ArmSmmu4KRange r=resource(2,3,1);if(upper)r.iova=peer_arena.iova;
+        if(unmap) {
+            CHECK(!pair_update(&lo,&hi,&r,upper,1));
+            if(upper){hi.ranges=&r;hi.count=1;}else{lo.ranges=&r;lo.count=1;}
+        }
+        reset_counters();CHECK(!pair_update(&lo,&hi,&r,upper,!unmap));calls=f.calls;CHECK(calls);
+    }
+    for(size_t failed=1;failed<=calls;++failed) {
         setup_pair(48,48,0);
         lo=(ArmSmmu4KLiveRegion){&arena,&state,0,0};hi=(ArmSmmu4KLiveRegion){&peer_arena,&peer_state,0,0};
         ArmSmmu4KRange r=resource(2,3,1);if(upper)r.iova=peer_arena.iova;
@@ -325,6 +347,7 @@ static unsigned pair_failures(void)
         CHECK(state.poisoned && peer_state.poisoned && result.must_retain_resources && !result.complete);
         size_t previous=f.calls;
         CHECK(pair_update(&lo,&hi,&r,upper,!unmap)==ArmSmmu4KArgument && f.calls==previous);++controls;
+    }
     }
     for(unsigned mutation=1;mutation<=4;++mutation) {
         setup_pair(48,48,0);lo=(ArmSmmu4KLiveRegion){&arena,&state,0,0};hi=(ArmSmmu4KLiveRegion){&peer_arena,&peer_state,0,0};
@@ -391,14 +414,19 @@ static unsigned batches(void)
     reset_counters();CHECK(batch(rest,2,wrong,2,0)==ArmSmmu4KStateMismatch && !f.calls);++controls;
     reset_counters();CHECK(batch(rest,2,rest,2,0)==ArmSmmu4KSuccess);complete(1,0);++controls;
     /* Every register access of a batch failing, before or after its write, poisons and retains. */
+    for(unsigned unmap=0;unmap<2;++unmap)for(unsigned after=0;after<2;++after) {
+    /* The accesses without a failure: the first map's (whole verification) or the unmap's after it (not). */
     setup(48,0,48,0,0x1ff000);scattered(pages);
-    CHECK(batch(0,0,pages,4,1)==ArmSmmu4KSuccess);size_t calls=f.calls;
-    for(unsigned unmap=0;unmap<2;++unmap)for(unsigned after=0;after<2;++after)for(size_t failed=1;failed<=calls;++failed) {
+    CHECK(batch(0,0,pages,4,1)==ArmSmmu4KSuccess);
+    if(unmap) {reset_counters();CHECK(batch(pages,4,pages,4,0)==ArmSmmu4KSuccess);}
+    const size_t calls=f.calls;CHECK(calls);
+    for(size_t failed=1;failed<=calls;++failed) {
         setup(48,0,48,0,0x1ff000);scattered(pages);
         if(unmap) {CHECK(batch(0,0,pages,4,1)==ArmSmmu4KSuccess);reset_counters();}
         f.fail_call=failed;f.after_write=after;
         CHECK(batch(unmap?pages:0,unmap?4:0,pages,4,!unmap)==ArmSmmu4KIoError);
         CHECK(state.poisoned && result.must_retain_resources && !result.complete);++controls;
+    }
     }
     return controls;
 }
@@ -446,6 +474,6 @@ int main(void)
     puts("Host fixtures only: no physical table provenance, cache-coherence, hardware TLB, GPU execution or fence qualification");
     unsigned pairs=pair_profiles(),pair_faults=pair_failures();
     printf("PASS: %u dual-region native4K profiles and %u dual-region failure/alias/isolation controls, both graphs audited and retained on uncertainty\n",pairs,pair_faults);
-    printf("PASS: %u batched scattered-page map/unmap transactions and refusals: one publication per leaf page, one TLB synchronization each\n",batches());
+    printf("PASS: %u batched scattered-page map/unmap transactions and refusals: one publication per leaf page, a TLB synchronization for each unmap and whole verification\n",batches());
     printf("PASS: %u incremental-verification controls: a changed leaf is proved before and after its store, the whole region every 64th update\n",incremental());
 }
