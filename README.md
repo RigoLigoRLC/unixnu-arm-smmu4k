@@ -1,7 +1,7 @@
 # ArmSmmu4K
 
-ARM SMMUv2 native 4 KiB table kit. Builds stage-1 tables, context and streams, updates live mappings and performs TLB maintenance.
+ARM SMMU translation with 4 KiB pages.
 
-Current state: used by the GPU and storage SMMU paths on sheng.
+used by the GPU and storage SMMU paths on sheng.
 
-Built into the kernel with the sheng storage and GPU stacks.
+Build and interface details: [documentation](https://unixnu.com/reference/components). Component sources and dependencies: [catalog](https://unixnu.com/reference/components).
