@@ -413,6 +413,23 @@ static unsigned batches(void)
     ArmSmmu4KRange rest[2]={pages[0],pages[3]},wrong[2]={pages[0],pages[3]};wrong[1].physical+=4096;
     reset_counters();CHECK(batch(rest,2,wrong,2,0)==ArmSmmu4KStateMismatch && !f.calls);++controls;
     reset_counters();CHECK(batch(rest,2,rest,2,0)==ArmSmmu4KSuccess);complete(1,0);++controls;
+    /* An exclusive map skips the alias check against the existing ranges only: a page of another class over a mapped one's physical
+     * page refuses as a plain map and is taken as an exclusive one; aliases among its own changes still refuse, and so does a mapped page. */
+    {
+        ArmSmmu4KLiveRegion lo={&arena,&state,0,0};
+        reset_counters();CHECK(batch(0,0,pages,1,1)==ArmSmmu4KSuccess);
+        ArmSmmu4KRange other=pages[1];other.physical=pages[0].physical;other.writeback=1;other.shareability=3;
+        CHECK(batch(pages,1,&other,1,1)==ArmSmmu4KOverlap);++controls;
+        lo.ranges=pages;lo.count=1;
+        ArmSmmu4KRange pair[2]={pages[1],pages[2]};pair[1].physical=pair[0].physical;pair[1].writeback=1;pair[1].shareability=3;
+        CHECK(ArmSmmu4KLiveMapContextBatchExclusive(&io,0,&context,&lo,0,0,&visibility,pair,2,4,&result)==ArmSmmu4KOverlap);++controls;
+        CHECK(ArmSmmu4KLiveMapContextBatchExclusive(&io,0,&context,&lo,0,0,&visibility,pages,1,4,&result)==ArmSmmu4KStateMismatch);++controls;
+        CHECK(!state.poisoned);
+        reset_counters();CHECK(ArmSmmu4KLiveMapContextBatchExclusive(&io,0,&context,&lo,0,0,&visibility,&other,1,4,&result)==ArmSmmu4KSuccess);
+        CHECK(pte(other.iova));++controls;
+        ArmSmmu4KRange both[2]={pages[0],other};
+        reset_counters();CHECK(batch(both,2,both,2,0)==ArmSmmu4KSuccess);CHECK(!pte(pages[0].iova) && !pte(other.iova));++controls;
+    }
     /* Every register access of a batch failing, before or after its write, poisons and retains. */
     for(unsigned unmap=0;unmap<2;++unmap)for(unsigned after=0;after<2;++after) {
     /* The accesses without a failure: the first map's (whole verification) or the unmap's after it (not). */
@@ -442,8 +459,8 @@ static uint64_t *leaf_of(uint64_t va)
         at=(size_t)(((*entry&UINT64_C(0x0000fffffffff000))-arena.config.table_physical)/8);++level;
     }
 }
-/* Between whole-region updates (every 64th of a region) an update proves the leaves it changes: a changed leaf holding something
- * else refuses before any store; a corrupted descriptor elsewhere is found by the next whole-region update. */
+/* After a region's first, whole-region update an update proves the leaves it changes: a changed leaf holding something else refuses
+ * before any store; a descriptor elsewhere is not read again (ArmSmmu4KLiveAudit proves the whole region on request). */
 static unsigned incremental(void)
 {
     unsigned count=0;
@@ -464,7 +481,7 @@ static unsigned incremental(void)
     }
     reset_counters();CHECK(update(&r,1,&r2,1)==ArmSmmu4KSuccess && !result.whole_verification && state.generation==64);
     *leaf_of(r.iova+8*4096)=UINT64_C(0x40000703);reset_counters();
-    CHECK(update(both,2,&r2,0)==ArmSmmu4KStateMismatch && result.whole_verification && state.poisoned && !f.writes);++count;
+    CHECK(update(both,2,&r2,0)==ArmSmmu4KSuccess && !result.whole_verification && !state.poisoned);++count;
     return count;
 }
 int main(void)
@@ -475,5 +492,5 @@ int main(void)
     unsigned pairs=pair_profiles(),pair_faults=pair_failures();
     printf("PASS: %u dual-region native4K profiles and %u dual-region failure/alias/isolation controls, both graphs audited and retained on uncertainty\n",pairs,pair_faults);
     printf("PASS: %u batched scattered-page map/unmap transactions and refusals: one publication per leaf page, a TLB synchronization for each unmap and whole verification\n",batches());
-    printf("PASS: %u incremental-verification controls: a changed leaf is proved before and after its store, the whole region every 64th update\n",incremental());
+    printf("PASS: %u incremental-verification controls: a changed leaf is proved before and after its store, the whole region on the first update\n",incremental());
 }
