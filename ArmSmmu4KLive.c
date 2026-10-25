@@ -489,7 +489,11 @@ static ArmSmmu4KStatus update(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *st
         status=ArmSmmu4KSynchronizeOwnedContext(io,bank,context,budget,&r->synchronization);
         if(status!=ArmSmmu4KSuccess)goto poisoned;
     } else if(!map) {
-        status=ArmSmmu4KSyncContextTlb(io,state->context_offset,context->asid,0,budget,&r->synchronization);
+        /* Up to ArmSmmu4KTlbPageLimit pages are dropped one by one and the rest of the ASID's translations stay cached; a bigger
+         * unmap invalidates the ASID (i568: 3622 unmaps each emptied the GPU's TLB). */
+        status=changed<=ArmSmmu4KTlbPageLimit?
+            ArmSmmu4KSyncContextTlbPages(io,state->context_offset,context->asid,changes,change_count,budget,&r->synchronization):
+            ArmSmmu4KSyncContextTlb(io,state->context_offset,context->asid,0,budget,&r->synchronization);
         if(status!=ArmSmmu4KSuccess)goto poisoned;
     }
     if(whole) {

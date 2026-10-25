@@ -15,7 +15,7 @@ static ArmSmmu4KLiveState peer_state;
 static unsigned pair_mode;
 typedef struct {
     uint64_t registers[MMIO_BYTES/8];
-    size_t calls,fail_call,publication_calls,fail_publication,tlbi_calls,sync_calls;
+    size_t calls,fail_call,publication_calls,fail_publication,tlbi_calls,sync_calls,page_tlbi_calls;
     size_t writes,barriers,cb;
     unsigned after_write,timeout,dirty,require_published,mutate_on_publish;
     unsigned synced,clean_observed;
@@ -56,7 +56,7 @@ static int write32(void *cookie,size_t at,uint32_t value)
         CHECK(f.publication_calls && f.clean_observed && !f.dirty);
     }
     if(at==f.cb+0x610) {CHECK(value==context.asid);++f.tlbi_calls;f.synced=0;}
-    if(at==f.cb+0x7f0) {CHECK(f.tlbi_calls && value==UINT32_MAX);++f.sync_calls;}
+    if(at==f.cb+0x7f0) {CHECK((f.tlbi_calls || f.page_tlbi_calls) && value==UINT32_MAX);++f.sync_calls;}
     if(at==f.cb+0x58)put32(at,get32(at)&~value);
     else put32(at,value);
     return fail;
@@ -64,7 +64,9 @@ static int write32(void *cookie,size_t at,uint32_t value)
 static int write64(void *cookie,size_t at,uint64_t value)
 {
     int fail=call(cookie,at,8);++f.writes;
-    CHECK(!f.require_published);
+    /* The one 64-bit write of a live update: TLBIVAL of a removed page, tagged with the context's ASID. */
+    if(at==f.cb+0x620) {CHECK((value>>48)==context.asid);++f.page_tlbi_calls;f.synced=0;}
+    else CHECK(!f.require_published);
     if(fail && !f.after_write)return 1;put64(at,value);return fail;
 }
 static int barrier(void *cookie)
@@ -89,7 +91,7 @@ static int publish(void *cookie,volatile uint64_t *page,size_t bytes)
 static void reset_counters(void)
 {
     f.calls=f.fail_call=f.publication_calls=f.fail_publication=0;
-    f.tlbi_calls=f.sync_calls=f.writes=f.barriers=0;
+    f.tlbi_calls=f.sync_calls=f.page_tlbi_calls=f.writes=f.barriers=0;
     f.after_write=f.timeout=f.mutate_on_publish=f.synced=f.clean_observed=0;
     f.require_published=f.dirty=1;
 }
@@ -143,8 +145,9 @@ static void complete(unsigned removed,size_t pages)
     /* A whole-verification update observes the context and synchronizes its ASID; between them an unmap synchronizes it alone and a
      * map of invalid leaves needs neither. */
     if(result.whole_verification)CHECK(result.synchronization.tlb_synchronized && f.tlbi_calls==1 && f.sync_calls==1 && f.synced && f.barriers>=4);
-    else if(removed)CHECK(result.synchronization.tlb_synchronized && f.tlbi_calls==1 && f.sync_calls==1 && f.synced && f.barriers>=3);
-    else CHECK(!result.synchronization.tlb_synchronized && !f.tlbi_calls && !f.sync_calls);
+    else if(removed)CHECK(result.synchronization.tlb_synchronized && (f.page_tlbi_calls?!f.tlbi_calls:f.tlbi_calls==1) &&
+        f.sync_calls==1 && f.synced && f.barriers>=2);
+    else CHECK(!result.synchronization.tlb_synchronized && !f.tlbi_calls && !f.page_tlbi_calls && !f.sync_calls);
     /* A whole-region update reads every descriptor; the others read each changed leaf's path before and after the store. */
     CHECK(result.whole_verification?result.descriptor_reads>=state.tables.table_pages*1024:result.descriptor_reads>=2);
 }
@@ -409,6 +412,7 @@ static unsigned batches(void)
     CHECK(batch(pages,4,pages+2,2,1)==ArmSmmu4KStateMismatch && !f.calls && !memcmp(snapshot,tables,sizeof(tables)));++controls;
     /* Unmap a sub-batch given as part of the region's own ranges. */
     reset_counters();CHECK(batch(pages,4,pages+1,2,0)==ArmSmmu4KSuccess);complete(1,2);
+    CHECK(f.page_tlbi_calls==2 && !f.tlbi_calls);   /* the two removed pages, each by its own TLBIVAL */
     CHECK(pte(pages[0].iova) && !pte(pages[1].iova) && !pte(pages[2].iova) && pte(pages[3].iova));++controls;
     ArmSmmu4KRange rest[2]={pages[0],pages[3]},wrong[2]={pages[0],pages[3]};wrong[1].physical+=4096;
     reset_counters();CHECK(batch(rest,2,wrong,2,0)==ArmSmmu4KStateMismatch && !f.calls);++controls;

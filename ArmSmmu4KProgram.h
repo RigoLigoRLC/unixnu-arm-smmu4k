@@ -58,6 +58,12 @@ ArmSmmu4KStatus ArmSmmu4KSynchronizeOwnedContext(const ArmSmmu4KIo *,unsigned ba
  * between its whole-verification updates). */
 ArmSmmu4KStatus ArmSmmu4KSyncContextTlb(const ArmSmmu4KIo *,uint64_t context_offset,unsigned asid,unsigned all,
     unsigned poll_budget,ArmSmmu4KProgramResult *);
+/* As ArmSmmu4KSyncContextTlb, but TLBIVAL of every page of the given ranges (4K aligned, at most ArmSmmu4KTlbPageLimit pages) for the ASID
+ * instead of TLBIASID, then the bounded TLBSYNC: an unmap drops the translations it removed and keeps every other cached one, as
+ * Linux's io-pgtable unmap does (TLBIASID on each unmap emptied the GPU's whole TLB). For leaf changes only. */
+enum {ArmSmmu4KTlbPageLimit=512};
+ArmSmmu4KStatus ArmSmmu4KSyncContextTlbPages(const ArmSmmu4KIo *,uint64_t context_offset,unsigned asid,
+    const ArmSmmu4KRange *ranges,size_t count,unsigned poll_budget,ArmSmmu4KProgramResult *);
 /* As ArmSmmu4KSynchronizeOwnedContext, but with TLBIALL for the bank instead of TLBIASID: every cached translation of the bank goes,
  * whatever ASID it was tagged with. */
 ArmSmmu4KStatus ArmSmmu4KInvalidateAllOwnedContext(const ArmSmmu4KIo *,unsigned bank,
