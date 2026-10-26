@@ -3,6 +3,20 @@
 #define PAGE UINT64_C(4096)
 #define PA_MASK UINT64_C(0x0000fffffffff000)
 
+uint64_t (*arm_smmu_4k_live_now_us)(void);
+volatile uint64_t arm_smmu_4k_live_phase_us[2][8];
+
+static void phase_lap(uint64_t (*now_us)(void),uint64_t *last,uint64_t *elapsed)
+{
+    if(!now_us) {
+        return;
+    }
+
+    const uint64_t now=now_us();
+    *elapsed=now-*last;
+    *last=now;
+}
+
 static int output_width(unsigned bits)
 {return bits==32 || bits==36 || bits==40 || bits==42 || bits==44 || bits==48;}
 static ArmSmmu4KStatus layout(const ArmSmmu4KLiveArena *a,ArmSmmu4KResult *out)
@@ -324,8 +338,8 @@ static int overlaps(uint64_t a,uint64_t abytes,uint64_t b,uint64_t bbytes)
 {return a<b+bbytes && b<a+abytes;}
 static int touches_pool(const ArmSmmu4KRange *r,const ArmSmmu4KLiveArena *a)
 {return overlaps(r->physical,r->bytes,a->config.table_physical,a->capacity_pages*PAGE);}
-static ArmSmmu4KStatus region_metadata(const ArmSmmu4KLiveRegion *region,
-    const ArmSmmu4KConfig *config,const ArmSmmu4KResult *root,unsigned upper,int aliases)
+static ArmSmmu4KStatus region_binding(const ArmSmmu4KLiveRegion *region,
+    const ArmSmmu4KConfig *config,const ArmSmmu4KResult *root,unsigned upper)
 {
     if(!region)return (!config && !root)?ArmSmmu4KSuccess:ArmSmmu4KArgument;
     if(!region->arena || !region->state || region->arena->upper_region!=upper ||
@@ -336,9 +350,60 @@ static ArmSmmu4KStatus region_metadata(const ArmSmmu4KLiveRegion *region,
     const ArmSmmu4KResult *r=&region->state->tables;
     if(r->root_physical!=shape.root_physical || r->mair!=shape.mair || r->table_pages!=shape.table_pages ||
         r->start_level!=shape.start_level || r->upper_region!=shape.upper_region)return ArmSmmu4KArgument;
+
+    return ArmSmmu4KSuccess;
+}
+
+static ArmSmmu4KStatus region_metadata(const ArmSmmu4KLiveRegion *region,
+    const ArmSmmu4KConfig *config,const ArmSmmu4KResult *root,unsigned upper,int aliases)
+{
+    ArmSmmu4KStatus status=region_binding(region,config,root,upper);
+    if(status || !region) {
+        return status;
+    }
+
     size_t leaves=0;
     status=validate_ranges_checked(region->arena,region->ranges,region->count,&leaves,aliases);if(status)return status;
-    return leaves==r->leaf_pages?ArmSmmu4KSuccess:ArmSmmu4KArgument;
+    return leaves==region->state->tables.leaf_pages?ArmSmmu4KSuccess:ArmSmmu4KArgument;
+}
+
+/* The context binding identifies the enabled table arenas and their retained
+ * leaf counts. The caller owns the existing resource lists between updates. */
+static ArmSmmu4KStatus context_binding(const ArmSmmu4KContextConfig *context,
+    const ArmSmmu4KLiveRegion *lower,const ArmSmmu4KLiveRegion *upper)
+{
+    if(!context || (!lower && !upper)) {
+        return ArmSmmu4KArgument;
+    }
+
+    ArmSmmu4KStatus status=region_binding(lower,context->lower,context->lower_tables,0);
+    if(status) {
+        return status;
+    }
+
+    status=region_binding(upper,context->upper,context->upper_tables,1);
+    if(status) {
+        return status;
+    }
+
+    const ArmSmmu4KLiveRegion *regions[]={lower,upper};
+    for(unsigned i=0;i<2;++i) {
+        const ArmSmmu4KLiveRegion *region=regions[i];
+        if(region && region->state->tables.leaf_pages>region->arena->config.leaf_budget) {
+            return ArmSmmu4KBudget;
+        }
+    }
+
+    if(lower && upper) {
+        const ArmSmmu4KLiveArena *a=lower->arena,*b=upper->arena;
+        if(lower->state==upper->state || a->config.output_bits!=b->config.output_bits ||
+            overlaps(a->config.table_physical,a->capacity_pages*PAGE,b->config.table_physical,b->capacity_pages*PAGE) ||
+            overlaps((uintptr_t)a->mapping,a->capacity_pages*PAGE,(uintptr_t)b->mapping,b->capacity_pages*PAGE)) {
+            return ArmSmmu4KOverlap;
+        }
+    }
+
+    return ArmSmmu4KSuccess;
 }
 /* aliases=0 (an update that is not its region's whole-verification one) skips the existing ranges' alias checks against each other
  * and across the regions: each range was checked against all of them when it was mapped, and the 64th update re-proves them. */
@@ -377,6 +442,7 @@ static ArmSmmu4KStatus update(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *st
     const ArmSmmu4KIo *io,unsigned bank,const ArmSmmu4KContextConfig *context,
     const ArmSmmu4KLiveVisibility *visibility,const ArmSmmu4KRange *before,size_t count,
     const ArmSmmu4KLiveRegion *peer,const ArmSmmu4KRange *changes,size_t change_count,unsigned map,unsigned budget,
+    unsigned caller_validated,
     ArmSmmu4KLiveResult *r)
 {
     if(!r)return ArmSmmu4KArgument;
@@ -384,6 +450,11 @@ static ArmSmmu4KStatus update(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *st
     if(!state || !state->prepared || state->poisoned || !context ||
         !visibility || !visibility->publish_table_page || map>1 || !change_count ||
         !budget || budget>1048576 || state->generation==UINT64_MAX)return ArmSmmu4KArgument;
+
+    uint64_t (*now_us)(void)=caller_validated?arm_smmu_4k_live_now_us:0;
+    const uint64_t began=now_us?now_us():0;
+    uint64_t phase_start=began,phase_us[5]={0};
+
     ArmSmmu4KResult shape;
     ArmSmmu4KStatus status=layout(a,&shape);
     if(status!=ArmSmmu4KSuccess)return status;
@@ -394,16 +465,25 @@ static ArmSmmu4KStatus update(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *st
         state->tables.mair!=shape.mair || state->tables.table_pages!=shape.table_pages ||
         state->tables.start_level!=shape.start_level || state->tables.upper_region!=shape.upper_region)
         return ArmSmmu4KArgument;
-    /* Every 64th update of a region (its first included) re-proves the whole region: the existing ranges against each other and every
-     * table descriptor before and after. The others prove what they change: each changed leaf holds its old descriptor before the store
-     * and its new one after it, the existing ranges are still sorted, disjoint and in budget, and the changes conflict with none of
-     * them. The ranges were each checked as changes when they were added, and the tables were last proved whole at most 63 updates ago.
-     * A whole-region walk read every descriptor of a 2 GiB aperture four times per update (int-143: 10 ms per buffer map). */
-    const int whole=(state->generation&63)==0;
+    /* The complete-range entry points audit the whole region every 64 updates.
+     * UpdateContextRanges receives changes already checked against the caller's
+     * objects and validates the actual changed descriptors on every update. */
+    const int whole=!caller_validated && (state->generation&63)==0;
     r->whole_verification=whole?1u:0u;
-    size_t leaves=0;
-    status=validate_ranges_checked(a,before,count,&leaves,whole);if(status!=ArmSmmu4KSuccess)return status;
-    if(leaves!=state->tables.leaf_pages)return ArmSmmu4KArgument;
+    size_t leaves=state->tables.leaf_pages;
+    if(caller_validated) {
+        if(leaves>a->config.leaf_budget) {
+            return ArmSmmu4KBudget;
+        }
+    } else {
+        status=validate_ranges_checked(a,before,count,&leaves,whole);
+        if(status!=ArmSmmu4KSuccess) {
+            return status;
+        }
+        if(leaves!=state->tables.leaf_pages) {
+            return ArmSmmu4KArgument;
+        }
+    }
     /* The changes: sorted, disjoint, each valid; together within the leaf budget. */
     size_t changed=0;
     if(!changes)return ArmSmmu4KBadRange;
@@ -417,26 +497,40 @@ static ArmSmmu4KStatus update(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *st
     }
     if(peer) {
         ArmSmmu4KLiveRegion target={a,state,before,count};
-        status=context_metadata(context,a->upper_region?peer:&target,a->upper_region?&target:peer,whole);
+        status=caller_validated?
+            context_binding(context,a->upper_region?peer:&target,a->upper_region?&target:peer):
+            context_metadata(context,a->upper_region?peer:&target,a->upper_region?&target:peer,whole);
         if(status)return status;
         for(size_t i=0;i<change_count;++i)if(touches_pool(&changes[i],peer->arena))return ArmSmmu4KOverlap;
-        if(map && any_conflicting_alias(a,changes,change_count,peer->ranges,peer->count))return ArmSmmu4KOverlap;
+        if(map && !caller_validated && any_conflicting_alias(a,changes,change_count,peer->ranges,peer->count))return ArmSmmu4KOverlap;
     }
     if(map && changed>a->config.leaf_budget-leaves)return ArmSmmu4KBudget;
-    if(map && (any_conflicting_alias(a,changes,change_count,changes,change_count) ||
-        any_conflicting_alias(a,changes,change_count,before,count)))return ArmSmmu4KOverlap;
-    for(size_t i=0;i<change_count;++i)for(uint64_t offset=0;offset<changes[i].bytes;offset+=PAGE) {
-        uint64_t va=changes[i].iova+offset,old=expected(before,count,va);
-        if(map?old!=0:old!=descriptor(&changes[i],va))return ArmSmmu4KStateMismatch;
+    if(caller_validated && !map && changed>leaves) {
+        return ArmSmmu4KStateMismatch;
     }
-    /* The context image and faults are observed around the stores of the whole-verification updates only (every 64th, the first
-     * included), and remembered there. Between them the bank stays the caller's exclusively owned one; each of these reads is a
-     * device register access, and an update observed it five times (int-159: 1.1 ms of a 1.7 ms buffer map). */
+
+    if(map && (any_conflicting_alias(a,changes,change_count,changes,change_count) ||
+        (!caller_validated && any_conflicting_alias(a,changes,change_count,before,count))))return ArmSmmu4KOverlap;
+    if(!caller_validated) {
+        for(size_t i=0;i<change_count;++i) {
+            for(uint64_t offset=0;offset<changes[i].bytes;offset+=PAGE) {
+                uint64_t va=changes[i].iova+offset,old=expected(before,count,va);
+                if(map?old!=0:old!=descriptor(&changes[i],va)) {
+                    return ArmSmmu4KStateMismatch;
+                }
+            }
+        }
+    }
+    /* The first update observes the owned context and records its register
+     * offset. Complete-range audits repeat this observation. The caller retains
+     * the context bank and observes its streams between those operations. */
     const int observed=whole || !state->context_offset;
     if(observed) {
         status=ArmSmmu4KObserveOwnedContext(io,bank,context,&r->synchronization);
         if(status!=ArmSmmu4KSuccess)goto poisoned;
     }
+    phase_lap(now_us,&phase_start,&phase_us[0]);
+
     if(whole) {
         status=verify(a,&shape,before,count,0,0,0,r);if(status!=ArmSmmu4KSuccess)goto poisoned;
         if(peer) {
@@ -454,6 +548,8 @@ static ArmSmmu4KStatus update(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *st
             initial.id2!=r->synchronization.id2 || initial.context_offset!=r->synchronization.context_offset)
             {status=ArmSmmu4KStateMismatch;goto poisoned;}
     }
+    phase_lap(now_us,&phase_start,&phase_us[1]);
+
     /* All validation precedes the first store. Caller keeps every master
      * quiesced and retains both old/new object references through this call. */
     for(size_t i=0;i<change_count;++i)for(uint64_t offset=0;offset<changes[i].bytes;offset+=PAGE) {
@@ -472,6 +568,8 @@ static ArmSmmu4KStatus update(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *st
             ++r->published_pages;last_page=page;
         }
     }
+    phase_lap(now_us,&phase_start,&phase_us[2]);
+
     /* A map of leaves that were invalid needs no TLB invalidation: the TLBs hold no translation of an invalid descriptor (as Linux's
      * io-pgtable maps without one). The unmap invalidates the ASID before it reports the translation removed. */
     if(observed) {
@@ -481,6 +579,8 @@ static ArmSmmu4KStatus update(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *st
         status=ArmSmmu4KSyncContextTlb(io,state->context_offset,context->asid,0,budget,&r->synchronization);
         if(status!=ArmSmmu4KSuccess)goto poisoned;
     }
+    phase_lap(now_us,&phase_start,&phase_us[3]);
+
     if(whole) {
         status=verify(a,&shape,before,count,changes,change_count,map,r);if(status!=ArmSmmu4KSuccess)goto poisoned;
         if(peer) {
@@ -498,8 +598,23 @@ static ArmSmmu4KStatus update(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *st
             {status=ArmSmmu4KStateMismatch;goto poisoned;}
         state->context_offset=r->synchronization.context_offset;
     }
+    phase_lap(now_us,&phase_start,&phase_us[4]);
+
     state->tables.leaf_pages=map?leaves+changed:leaves-changed;++state->generation;
     r->complete=1;r->translation_removed=!map;r->must_retain_resources=0;
+    if(now_us) {
+        volatile uint64_t *totals=arm_smmu_4k_live_phase_us[map?0:1];
+        totals[0]=totals[0]+1;
+        for(unsigned i=0;i<5;++i) {
+            totals[i+1]=totals[i+1]+phase_us[i];
+        }
+        const uint64_t elapsed=phase_start-began;
+        if(elapsed>totals[6]) {
+            totals[6]=elapsed;
+        }
+        totals[7]=totals[7]+changed;
+    }
+
     return ArmSmmu4KSuccess;
 poisoned:
     state->poisoned=1;if(peer)peer->state->poisoned=1;return status;
@@ -508,7 +623,9 @@ ArmSmmu4KStatus ArmSmmu4KLiveUpdate(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveSta
     const ArmSmmu4KIo *io,unsigned bank,const ArmSmmu4KContextConfig *context,
     const ArmSmmu4KLiveVisibility *visibility,const ArmSmmu4KRange *before,size_t count,
     const ArmSmmu4KRange *change,unsigned map,unsigned budget,ArmSmmu4KLiveResult *r)
-{return update(a,state,io,bank,context,visibility,before,count,0,change,1,map,budget,r);}
+{
+    return update(a,state,io,bank,context,visibility,before,count,0,change,1,map,budget,0,r);
+}
 ArmSmmu4KStatus ArmSmmu4KLiveUpdateContextBatch(const ArmSmmu4KIo *io,unsigned bank,
     const ArmSmmu4KContextConfig *context,const ArmSmmu4KLiveRegion *lower,
     const ArmSmmu4KLiveRegion *upper,unsigned change_upper,const ArmSmmu4KLiveVisibility *visibility,
@@ -521,7 +638,34 @@ ArmSmmu4KStatus ArmSmmu4KLiveUpdateContextBatch(const ArmSmmu4KIo *io,unsigned b
     if(!target || !target->state)return ArmSmmu4KArgument;
     ArmSmmu4KStatus status=context_metadata(context,lower,upper,(target->state->generation&63)==0);if(status)return status;
     return update(target->arena,target->state,io,bank,context,visibility,target->ranges,target->count,
-        peer,changes,change_count,map,budget,r);
+        peer,changes,change_count,map,budget,0,r);
+}
+
+ArmSmmu4KStatus ArmSmmu4KLiveUpdateContextRanges(const ArmSmmu4KIo *io,unsigned bank,
+    const ArmSmmu4KContextConfig *context,const ArmSmmu4KLiveRegion *lower,
+    const ArmSmmu4KLiveRegion *upper,unsigned change_upper,const ArmSmmu4KLiveVisibility *visibility,
+    const ArmSmmu4KRange *changes,size_t change_count,unsigned map,unsigned budget,ArmSmmu4KLiveResult *r)
+{
+    if(!r) {
+        return ArmSmmu4KArgument;
+    }
+    *r=(ArmSmmu4KLiveResult){0};
+    r->must_retain_resources=1;
+
+    if(change_upper>1) {
+        return ArmSmmu4KArgument;
+    }
+    const ArmSmmu4KLiveRegion *target=change_upper?upper:lower,*peer=change_upper?lower:upper;
+    ArmSmmu4KStatus status=context_binding(context,lower,upper);
+    if(status) {
+        return status;
+    }
+    if(!target) {
+        return ArmSmmu4KArgument;
+    }
+
+    return update(target->arena,target->state,io,bank,context,visibility,0,0,
+        peer,changes,change_count,map,budget,1,r);
 }
 ArmSmmu4KStatus ArmSmmu4KLiveUpdateContext(const ArmSmmu4KIo *io,unsigned bank,
     const ArmSmmu4KContextConfig *context,const ArmSmmu4KLiveRegion *lower,

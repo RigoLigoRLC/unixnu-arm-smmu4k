@@ -20,7 +20,7 @@ typedef struct {
     ArmSmmu4KResult tables;
     uint64_t generation;
     unsigned prepared,poisoned;
-    /* The context bank's register offset the last whole-verification update observed its image at; 0 before the first. */
+    /* The context bank's register offset observed during a table transaction; zero before the first observation. */
     uint64_t context_offset;
 } ArmSmmu4KLiveState;
 typedef struct {
@@ -39,7 +39,7 @@ typedef struct {
 typedef struct {
     size_t descriptor_reads,descriptor_writes,published_pages;
     unsigned complete,translation_removed,must_retain_resources;
-    unsigned whole_verification;   /* this update re-proved the whole region (every 64th of a region) */
+    unsigned whole_verification;   /* This update checked every descriptor in the region. */
     ArmSmmu4KProgramResult synchronization;
 } ArmSmmu4KLiveResult;
 /* Prepare an INACTIVE empty native4K arena. Preallocate only real intermediate
@@ -108,6 +108,37 @@ ArmSmmu4KStatus ArmSmmu4KLiveUpdateContextBatch(const ArmSmmu4KIo *,unsigned ban
     const ArmSmmu4KLiveRegion *upper,unsigned change_upper,
     const ArmSmmu4KLiveVisibility *,const ArmSmmu4KRange *changes,size_t change_count,
     unsigned map,unsigned poll_budget,ArmSmmu4KLiveResult *);
+
+/* UpdateContextRanges receives the physical ranges of one map or unmap. The
+ * caller first audits the complete context with ArmSmmu4KLiveAuditContext and
+ * then changes its tables only through the live update functions. The caller
+ * checks each map's IOVA and physical cache/shareability/privilege attributes
+ * against every existing object, serializes updates, and retains the context
+ * bank, table allocations and resource ownership required by LiveUpdate.
+ *
+ * lower and upper identify the enabled arenas and states; their ranges/count
+ * fields may be null/zero. The kit checks the arena bindings, retained leaf
+ * budget, sorted changes, physical table-pool overlap and aliases within the
+ * changes. It checks each changed leaf before writing it, publishes each
+ * changed table page, synchronizes the ASID on unmap and checks the new leaves.
+ * The first update also observes the context registers and saves their offset.
+ * Existing objects remain in the caller's mapping records. A failed table,
+ * context, publication or TLB operation poisons the affected states and keeps
+ * must_retain_resources set until the caller establishes hardware quiescence. */
+ArmSmmu4KStatus ArmSmmu4KLiveUpdateContextRanges(const ArmSmmu4KIo *,unsigned bank,
+    const ArmSmmu4KContextConfig *,const ArmSmmu4KLiveRegion *lower,
+    const ArmSmmu4KLiveRegion *upper,unsigned change_upper,
+    const ArmSmmu4KLiveVisibility *,const ArmSmmu4KRange *changes,size_t change_count,
+    unsigned map,unsigned poll_budget,ArmSmmu4KLiveResult *);
+
+/* Optional monotonic microsecond clock for UpdateContextRanges. The caller
+ * serializes timed updates and snapshots of the totals with its context lock.
+ * Each successful call adds one complete row; failures leave totals unchanged. */
+extern uint64_t (*arm_smmu_4k_live_now_us)(void);
+/* Rows: map, unmap. Columns: calls; validation and initial context observation;
+ * old leaf checks and context reread; writes and publication; TLB synchronization;
+ * new leaf checks and context observation; maximum call time; changed pages. */
+extern volatile uint64_t arm_smmu_4k_live_phase_us[2][8];
 #ifdef __cplusplus
 }
 #endif
