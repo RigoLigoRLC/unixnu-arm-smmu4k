@@ -5,6 +5,12 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+/* ArmSmmu4KShareability selects the SMMUv2 SHCFG transaction override. */
+typedef enum {
+    ArmSmmu4KShareabilityFromTransaction = 0,
+    ArmSmmu4KShareabilityNonShareable = 3
+} ArmSmmu4KShareability;
+
 typedef struct {
     /* A config/result pair from Build, BuildUpper or LivePrepare; NULL pair disables it.
      * A live arena may have zero mapped leaves while retaining its table topology.
@@ -16,6 +22,8 @@ typedef struct {
     unsigned asid;          /* 0..65535, ownership managed by the caller. */
     unsigned coherent_walk; /* Explicit: 1=inner WBWA, 0=outer NC. */
     unsigned stall_on_fault, continue_after_fault; /* Each 0 or 1. */
+    ArmSmmu4KShareability stream_shareability; /* S2CR.SHCFG for each owned stream. */
+    ArmSmmu4KShareability bypass_shareability; /* SCTLR.SHCFG for bypass transactions. */
 } ArmSmmu4KContextConfig;
 typedef struct {
     uint32_t cbar, cba2r, tcr, tcr2, mair0, mair1, sctlr, reserved_zero;

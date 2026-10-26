@@ -30,7 +30,13 @@ ArmSmmu4KStatus ArmSmmu4KEncodeContext(const ArmSmmu4KContextConfig *c,
     out->ttbr0=out->ttbr1=0;
     if(!c || (!c->lower && !c->upper) || c->asid>65535 || c->coherent_walk>1 ||
         c->stall_on_fault>1 || c->continue_after_fault>1 ||
-        !region_valid(c->lower,c->lower_tables,0) || !region_valid(c->upper,c->upper_tables,1))return ArmSmmu4KArgument;
+        (c->stream_shareability!=ArmSmmu4KShareabilityFromTransaction &&
+            c->stream_shareability!=ArmSmmu4KShareabilityNonShareable) ||
+        (c->bypass_shareability!=ArmSmmu4KShareabilityFromTransaction &&
+            c->bypass_shareability!=ArmSmmu4KShareabilityNonShareable) ||
+        !region_valid(c->lower,c->lower_tables,0) || !region_valid(c->upper,c->upper_tables,1)) {
+        return ArmSmmu4KArgument;
+    }
     unsigned va=width_bits((c->id2>>8)&15),pa=width_bits((c->id2>>4)&15);
     if(!(c->id0&(UINT32_C(1)<<30)) || !(c->id2&(1u<<12)) || !va || !pa)return ArmSmmu4KUnsupported;
     const ArmSmmu4KConfig *basis=c->lower?c->lower:c->upper;
@@ -55,7 +61,8 @@ ArmSmmu4KStatus ArmSmmu4KEncodeContext(const ArmSmmu4KContextConfig *c,
     if(c->lower)v.ttbr0|=c->lower_tables->root_physical;
     if(c->upper)v.ttbr1|=c->upper_tables->root_physical;
     v.mair0=0xff44;v.mair1=0;
-    v.sctlr=0x1067|(c->stall_on_fault<<7)|(c->continue_after_fault<<8);
+    v.sctlr=0x1067|(c->stall_on_fault<<7)|(c->continue_after_fault<<8)|
+        ((uint32_t)c->bypass_shareability<<22);
     v.reserved_zero=0;
     *out=v;
     return ArmSmmu4KSuccess;
