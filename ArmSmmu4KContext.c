@@ -51,7 +51,7 @@ ArmSmmu4KStatus ArmSmmu4KEncodeContext(const ArmSmmu4KContextConfig *c,
     v.cbar=0x1f300; /* Stage1 translation, stage2 bypass; weakest bypass attrs. */
     v.cba2r=1;      /* AArch64. No stage2 VMID or guest translation. */
     v.tcr=UINT32_C(2)<<30; /* TG1=4K, TG0=4K. */
-    unsigned walk=c->coherent_walk?0x3500:0x2000;
+    unsigned walk=c->coherent_walk?0x2500:0x2000;
     if(c->lower)v.tcr|=walk|(64-c->lower->input_bits);
     else v.tcr|=1u<<7; /* EPD0 */
     if(c->upper)v.tcr|=(walk|(64-c->upper->input_bits))<<16;

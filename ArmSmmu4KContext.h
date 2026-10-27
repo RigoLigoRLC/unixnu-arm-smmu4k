@@ -20,7 +20,7 @@ typedef struct {
     const ArmSmmu4KResult *lower_tables, *upper_tables;
     uint32_t id0, id2;       /* Raw SMMUv2 identification register values. */
     unsigned asid;          /* 0..65535, ownership managed by the caller. */
-    unsigned coherent_walk; /* Explicit: 1=inner WBWA, 0=outer NC. */
+    unsigned coherent_walk; /* Outer-shareable table walks: 1=WBWA, 0=NC. */
     unsigned stall_on_fault, continue_after_fault; /* Each 0 or 1. */
     ArmSmmu4KShareability stream_shareability; /* S2CR.SHCFG for each owned stream. */
     ArmSmmu4KShareability bypass_shareability; /* SCTLR.SHCFG for bypass transactions. */
