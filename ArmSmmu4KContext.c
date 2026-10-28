@@ -75,10 +75,15 @@ ArmSmmu4KStatus ArmSmmu4KValidateContextReadback(const ArmSmmu4KContextConfig *c
      * writes it and never reads it back. A shared ASID namespace is safe because every bank's ASID is the
      * caller's exclusive lease. Only 1 -> 0 is accepted. */
     const uint32_t asidpne_clear=expected.sctlr&~observed->sctlr&UINT32_C(0x1000);
+    /* TCR.EPD1 (bit 23) is written 1 without an upper region but reads 0 once the Adreno CP switched TTBR0 itself (CP_SMMU_TABLE_UPDATE:
+     * the firmware enables both walks, as for Linux's split tables with the kernel in TTBR1). The device's addresses all lie in the
+     * lower region, so an upper walk is never asked for. Only 1 -> 0, only for a switched TTBR0 without an upper region. */
+    const uint32_t epd1_clear=c->ttbr0_switched && !c->upper?expected.tcr&~observed->tcr&UINT32_C(0x800000):0;
     if(expected.cbar!=observed->cbar || expected.cba2r!=observed->cba2r ||
-        expected.tcr!=observed->tcr || ((expected.tcr2^observed->tcr2)&~tbi_set) ||
+        ((expected.tcr^observed->tcr)&~epd1_clear) || ((expected.tcr2^observed->tcr2)&~tbi_set) ||
         expected.mair0!=observed->mair0 || expected.mair1!=observed->mair1 ||
-        ((expected.sctlr^observed->sctlr)&~asidpne_clear) || observed->reserved_zero || expected.ttbr0!=observed->ttbr0 ||
-        expected.ttbr1!=observed->ttbr1)return ArmSmmu4KStateMismatch;
+        ((expected.sctlr^observed->sctlr)&~asidpne_clear) || observed->reserved_zero ||
+        (!c->ttbr0_switched && expected.ttbr0!=observed->ttbr0) ||
+        ((!c->ttbr0_switched || c->upper) && expected.ttbr1!=observed->ttbr1))return ArmSmmu4KStateMismatch;
     return ArmSmmu4KSuccess;
 }

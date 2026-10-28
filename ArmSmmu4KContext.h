@@ -16,6 +16,10 @@ typedef struct {
     unsigned asid;          /* 0..65535, ownership managed by the caller. */
     unsigned coherent_walk; /* Explicit: 1=inner WBWA, 0=outer NC. */
     unsigned stall_on_fault, continue_after_fault; /* Each 0 or 1. */
+    /* 1: the bank's TTBR0 is switched among several lower-region tables, each with its own ASID (one table per GPU process, set by
+     * ArmSmmu4KWriteContextTtbr0 or by the device itself): a readback then holds whichever table is installed, so TTBR0 and, with no
+     * upper region, TTBR1 (the ASID alone) are not compared; every other register still is. 0 keeps the exact comparison. */
+    unsigned ttbr0_switched;
 } ArmSmmu4KContextConfig;
 typedef struct {
     uint32_t cbar, cba2r, tcr, tcr2, mair0, mair1, sctlr, reserved_zero;

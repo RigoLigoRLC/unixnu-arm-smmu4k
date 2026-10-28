@@ -22,6 +22,11 @@ typedef struct {
     unsigned prepared,poisoned;
     /* The context bank's register offset the last whole-verification update observed its image at; 0 before the first. */
     uint64_t context_offset;
+    /* 1: a table the bank does not run while it is updated (one of several switched into TTBR0, ArmSmmu4KContextConfig.ttbr0_switched).
+     * Its updates never observe the bank's image, which shows another table: the caller sets context_offset from the bank's owned
+     * table (whose updates observed it) before the first update. The table graphs are still proved as for an installed table, and an
+     * unmap still invalidates the table's own ASID, which also drops what it left cached while it ran. */
+    unsigned detached;
 } ArmSmmu4KLiveState;
 typedef struct {
     void *cookie;

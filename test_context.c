@@ -87,7 +87,7 @@ int main(void)
         for(unsigned fault=0;fault<4;++fault)for(unsigned ai=0;ai<3;++ai) {
             unsigned asids[]={0,1,65535};
             ArmSmmu4KContextConfig c={mode&1?&a:NULL,mode&2?&b:NULL,
-                mode&1?&ar:NULL,mode&2?&br:NULL,1u<<30,0x1555,asids[ai],coherent,fault&1,fault>>1};
+                mode&1?&ar:NULL,mode&2?&br:NULL,1u<<30,0x1555,asids[ai],coherent,fault&1,fault>>1,0};
             ArmSmmu4KContextImage v;
             CHECK(ArmSmmu4KEncodeContext(&c,&v)==ArmSmmu4KSuccess);
             uint32_t expected=UINT32_C(2)<<30;
@@ -127,7 +127,7 @@ int main(void)
             bad=c;bad.coherent_walk=2;refusal(bad,ArmSmmu4KArgument);
             bad=c;bad.stall_on_fault=2;refusal(bad,ArmSmmu4KArgument);
         }
-        ArmSmmu4KContextConfig c={&a,&b,&ar,&br,1u<<30,0x1555,7,1,1,1};
+        ArmSmmu4KContextConfig c={&a,&b,&ar,&br,1u<<30,0x1555,7,1,1,1,0};
         ArmSmmu4KContextConfig bad=c;bad.upper=NULL;refusal(bad,ArmSmmu4KArgument);
         bad=c;bad.lower_tables=NULL;refusal(bad,ArmSmmu4KArgument);
         bad=c;bad.continue_after_fault=2;refusal(bad,ArmSmmu4KArgument);

@@ -68,6 +68,10 @@ ArmSmmu4KStatus ArmSmmu4KSyncContextTlbPages(const ArmSmmu4KIo *,uint64_t contex
  * whatever ASID it was tagged with. */
 ArmSmmu4KStatus ArmSmmu4KInvalidateAllOwnedContext(const ArmSmmu4KIo *,unsigned bank,
     const ArmSmmu4KContextConfig *,unsigned poll_budget,ArmSmmu4KProgramResult *);
+/* Installs ttbr0 (a lower-region table root with its ASID in bits 63:48) in the context bank at context_offset, for a bank whose
+ * config has ttbr0_switched: barrier, the 64-bit write, barrier, readback. The caller keeps every master that uses the bank quiesced
+ * (no translation in flight) and owns the table; no TLB operation is needed for a table whose ASID is its own. */
+ArmSmmu4KStatus ArmSmmu4KWriteContextTtbr0(const ArmSmmu4KIo *,uint64_t context_offset,uint64_t ttbr0,ArmSmmu4KProgramResult *);
 /* Disable only if actual stage/format/roots/ASID/attributes still match the
  * expected owned context. Retain bank, mappings and tables on any uncertainty.
  * Does not release the caller's lease or power/stream/interrupt resources. */

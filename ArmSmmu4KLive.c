@@ -387,7 +387,7 @@ static ArmSmmu4KStatus update(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *st
 {
     if(!r)return ArmSmmu4KArgument;
     *r=(ArmSmmu4KLiveResult){0};r->must_retain_resources=1;
-    if(!state || !state->prepared || state->poisoned || !context ||
+    if(!state || !state->prepared || state->poisoned || !context || (state->detached && (!state->context_offset || !context->ttbr0_switched)) ||
         !visibility || !visibility->publish_table_page || map>1 || exclusive>map || !change_count ||
         !budget || budget>1048576 || state->generation==UINT64_MAX)return ArmSmmu4KArgument;
     ArmSmmu4KResult shape;
@@ -443,7 +443,7 @@ static ArmSmmu4KStatus update(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *st
     /* The context image and faults are observed around the stores of the whole-verification update only, and remembered there; the
      * caller observes its routes on its own schedule. After it the bank stays the caller's exclusively owned one; each of these
      * reads is a device register access, and an update observed it five times (int-159: 1.1 ms of a 1.7 ms buffer map). */
-    const int observed=whole || !state->context_offset;
+    const int observed=!state->detached && (whole || !state->context_offset);
     if(observed) {
         status=ArmSmmu4KObserveOwnedContext(io,bank,context,&r->synchronization);
         if(status!=ArmSmmu4KSuccess)goto poisoned;

@@ -71,7 +71,7 @@ static ArmSmmu4KIo reset(unsigned register_64k)
     size_t pages=register_64k?2:32;f.cb=(pages+f.bank)*f.gr1;
     put32(0x20,1u<<30);put32(0x24,register_64k?0x80000002:0x40020010);put32(0x28,0x1555);
     /* Deliberately wrong supplied IDs: only the real I/O reads may authorize. */
-    config=(ArmSmmu4KContextConfig){&lower,&upper,&lr,&ur,0,0,0xabcd,1,1,1};
+    config=(ArmSmmu4KContextConfig){&lower,&upper,&lr,&ur,0,0,0xabcd,1,1,1,0};
     ArmSmmu4KIo io={&f,BYTES,read32,read64,write32,write64,barrier};return io;
 }
 static size_t first(unsigned kind,size_t at)

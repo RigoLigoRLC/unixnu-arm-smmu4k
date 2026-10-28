@@ -108,7 +108,7 @@ static void setup(unsigned bits,unsigned upper,unsigned output,unsigned spacing,
     CHECK(audit.complete && audit.must_retain_resources && audit.descriptor_reads==state.tables.table_pages*512);
     for(size_t i=state.tables.table_pages*512;i<POOL_PAGES*512;++i)CHECK(tables[i]==UINT64_C(0xa5a5a5a5a5a5a5a5));
     context=(ArmSmmu4KContextConfig){upper?0:&arena.config,upper?&arena.config:0,
-        upper?0:&state.tables,upper?&state.tables:0,0,0,0x1234,1,1,1};
+        upper?0:&state.tables,upper?&state.tables:0,0,0,0x1234,1,1,1,0};
     put32(0x20,1u<<30);put32(0x24,spacing?0x80000002:0x40000010);put32(0x28,0x1555);
     f.cb=0x20000;
     io=(ArmSmmu4KIo){&f,MMIO_BYTES,read32,read64,write32,write64,barrier};

@@ -175,6 +175,19 @@ static ArmSmmu4KStatus synchronize(const ArmSmmu4KIo *io,unsigned bank,
         r->context_offset!=after.context_offset)return ArmSmmu4KStateMismatch;
     r->phase=9;return ArmSmmu4KSuccess;
 }
+ArmSmmu4KStatus ArmSmmu4KWriteContextTtbr0(const ArmSmmu4KIo *io,uint64_t context_offset,uint64_t ttbr0,ArmSmmu4KProgramResult *r)
+{
+    if(!r)return ArmSmmu4KArgument;
+    *r=(ArmSmmu4KProgramResult){0};r->must_retain_tables=1;
+    if(!io || !io->write64 || !io->read64 || !io->barrier || !context_offset || (ttbr0&0xfffu) ||
+        context_offset>io->register_bytes || io->register_bytes-context_offset<0x7f8)return ArmSmmu4KArgument;
+    r->context_offset=context_offset;
+    uint64_t readback=0;
+    if(io->barrier(io->cookie) || write64(io,(size_t)context_offset+0x20,ttbr0,r) || io->barrier(io->cookie) ||
+        io->read64(io->cookie,(size_t)context_offset+0x20,&readback))return ArmSmmu4KIoError;
+    if(readback!=ttbr0)return ArmSmmu4KStateMismatch;
+    r->phase=9;return ArmSmmu4KSuccess;
+}
 ArmSmmu4KStatus ArmSmmu4KSyncContextTlb(const ArmSmmu4KIo *io,uint64_t context_offset,unsigned asid,unsigned all,
     unsigned budget,ArmSmmu4KProgramResult *r)
 {
