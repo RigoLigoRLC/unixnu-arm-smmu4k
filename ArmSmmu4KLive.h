@@ -5,12 +5,23 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+/* Where an arena's table pages come from: one 4 KiB page at a time, as a walk first needs it (Linux io-pgtable-arm allocates its
+ * tables so, and Apple's pmap its page-table pages): no table of the aperture exists before a mapping needs it. */
 typedef struct {
-    ArmSmmu4KConfig config;
+    void *cookie;
+    /* A zeroed 4 KiB table page the caller owns for this arena, cacheable as every table page of it: its physical address and a
+     * writable CPU mapping of it. Nonzero: none could be had (nothing is changed). */
+    int (*allocate)(void *cookie,uint64_t *physical,volatile uint64_t **mapping);
+    /* The CPU mapping of a page allocate() gave this arena; NULL for any other physical address. */
+    volatile uint64_t *(*find)(void *cookie,uint64_t physical);
+    /* Nonzero when [physical, physical+bytes) overlaps a page allocate() gave this arena. */
+    int (*overlaps)(void *cookie,uint64_t physical,uint64_t bytes);
+} ArmSmmu4KTablePages;
+typedef struct {
+    ArmSmmu4KConfig config;           /* table_physical: the root table, a page of pages */
     uint64_t iova,bytes;              /* Bounded native VA aperture, no conversion. */
     unsigned upper_region;
-    volatile uint64_t *mapping;       /* Real writable CPU mapping of owned pool. */
-    size_t capacity_pages;
+    const ArmSmmu4KTablePages *pages;
     /* Optional caller-owned scratch for the physical-alias checks (one entry per range of the smaller compared side), used by one
      * call at a time; absent or too small, those checks compare pairwise. Never read as state. */
     uint32_t *alias_scratch;
@@ -47,13 +58,11 @@ typedef struct {
     unsigned whole_verification;   /* this update proved the whole region (a region's first) */
     ArmSmmu4KProgramResult synchronization;
 } ArmSmmu4KLiveResult;
-/* Prepare an INACTIVE empty native4K arena. Preallocate only real intermediate
- * table pages; all leaf slots remain invalid. No MMIO, TLB, allocator or cache
- * operations. The explicit leaf budget bounds aperture size and traversal.
- * state must be zero initialized and never reset while a context can access
- * the pool. Capacity errors do not write tables. Caller must publish all used
- * pages before enabling a context with &state->tables. This is not activation.
- * The pool uses a fixed owned topology; no shadow/rebuilt translation exists. */
+/* Prepare an INACTIVE empty native4K arena over its root table (config.table_physical, a zeroed page of arena->pages). No other
+ * table exists yet: a map allocates the tables its walk needs, publishes each before linking it and keeps it for the arena's life
+ * (an unmap clears leaves only, as Linux's io-pgtable does for a page unmap). No MMIO, TLB or cache operation here; the caller
+ * publishes the root before enabling a context with &state->tables. state must be zero initialized and never reset while a context
+ * can walk the tables. The leaf budget bounds the aperture's pages. This is not activation. */
 ArmSmmu4KStatus ArmSmmu4KLivePrepare(const ArmSmmu4KLiveArena *,ArmSmmu4KLiveState *);
 /* Read-only exact graph check, including reserved empty intermediate tables.
  * Use before context activation and while masters are quiesced. This neither
@@ -65,7 +74,8 @@ ArmSmmu4KStatus ArmSmmu4KLiveAudit(const ArmSmmu4KLiveArena *,const ArmSmmu4KLiv
  * descriptors are never overwritten with different valid descriptors.
  * before describes ALL currently mapped resources, sorted by native IOVA.
  * Exact physical graph checks precede/follow changes to the actual pool.
- * No copies/reference table graphs, block mappings or table retirement.
+ * A map first links the tables its leaves need (empty tables: no translation changes); a table that cannot be had refuses with
+ * ArmSmmu4KCapacity before any leaf is written, with the arena still consistent. No block mappings or table retirement.
  *
  * Requires a SINGLE enabled region rooted in this arena, an exclusive powered
  * bank/ASID/stream lease, installed fault handling, and ALL masters quiesced

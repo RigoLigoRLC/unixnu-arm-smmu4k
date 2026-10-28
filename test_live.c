@@ -13,6 +13,36 @@ static _Alignas(4096) uint64_t peer_tables[POOL_PAGES*512];
 static ArmSmmu4KLiveArena peer_arena;
 static ArmSmmu4KLiveState peer_state;
 static unsigned pair_mode;
+/* Table pages handed out one at a time from a fixture pool, as a driver allocates them: zeroed when given, found by their physical
+ * address, untouched (0xa5) until then. refuse_after: allocations left before the provider refuses (SIZE_MAX: never). */
+typedef struct {uint64_t *pool;uint64_t physical;size_t used,refuse_after;} Pages;
+static Pages main_pages,peer_pages;
+static int page_allocate(void *cookie,uint64_t *physical,volatile uint64_t **mapping)
+{
+    Pages *p=cookie;
+    if(p->used>=POOL_PAGES || !p->refuse_after)return 1;
+    if(p->refuse_after!=SIZE_MAX)--p->refuse_after;
+    memset(p->pool+p->used*512,0,4096);
+    *physical=p->physical+p->used*4096;*mapping=p->pool+p->used*512;++p->used;return 0;
+}
+static volatile uint64_t *page_find(void *cookie,uint64_t physical)
+{
+    Pages *p=cookie;
+    if(physical<p->physical || (physical&4095) || (physical-p->physical)/4096>=p->used)return 0;
+    return p->pool+(physical-p->physical)/8;
+}
+static int page_overlaps(void *cookie,uint64_t physical,uint64_t bytes)
+{Pages *p=cookie;return physical<p->physical+p->used*4096 && p->physical<physical+bytes;}
+static const ArmSmmu4KTablePages main_provider={&main_pages,page_allocate,page_find,page_overlaps};
+static const ArmSmmu4KTablePages peer_provider={&peer_pages,page_allocate,page_find,page_overlaps};
+/* A fresh provider over pool at physical, its root allocated. */
+static uint64_t pages_reset(Pages *p,uint64_t *pool,uint64_t physical)
+{
+    *p=(Pages){pool,physical,0,SIZE_MAX};
+    uint64_t root;volatile uint64_t *mapping;
+    CHECK(!page_allocate(p,&root,&mapping) && root==physical);
+    return root;
+}
 typedef struct {
     uint64_t registers[MMIO_BYTES/8];
     size_t calls,fail_call,publication_calls,fail_publication,tlbi_calls,sync_calls,page_tlbi_calls;
@@ -75,14 +105,15 @@ static int publish(void *cookie,volatile uint64_t *page,size_t bytes)
 {
     CHECK(cookie==&f && bytes==4096 && !((uintptr_t)page&4095));
     uintptr_t at=(uintptr_t)page;
-    CHECK((at>=(uintptr_t)tables && at-(uintptr_t)tables<state.tables.table_pages*4096) ||
-        (pair_mode && at>=(uintptr_t)peer_tables && at-(uintptr_t)peer_tables<peer_state.tables.table_pages*4096));
+    CHECK((at>=(uintptr_t)tables && at-(uintptr_t)tables<main_pages.used*4096) ||
+        (pair_mode && at>=(uintptr_t)peer_tables && at-(uintptr_t)peer_tables<peer_pages.used*4096));
     ++f.publication_calls;
     CHECK(!f.tlbi_calls && !f.sync_calls);
     if(f.publication_calls==f.fail_publication)return 1;
     if(f.publication_calls==1) {
         if(f.mutate_on_publish==1)put64(f.cb+0x28,get64(f.cb+0x28)^4096);
-        if(f.mutate_on_publish==2)tables[0]^=1;
+        /* A root slot no update writes (the first publication is of a table about to be linked into slot 0). */
+        if(f.mutate_on_publish==2)tables[1]^=1;
         if(f.mutate_on_publish==3)put32(f.cb+0x58,2);
         if(f.mutate_on_publish==4)peer_tables[0]^=1;
     }
@@ -99,14 +130,16 @@ static void setup(unsigned bits,unsigned upper,unsigned output,unsigned spacing,
 {
     memset(&state,0,sizeof(state));memset(&f,0,sizeof(f));memset(tables,0xa5,sizeof(tables));
     pair_mode=0;
-    arena=(ArmSmmu4KLiveArena){{bits,output,0x10000000,16},
-        (upper?UINT64_MAX-(UINT64_C(1)<<bits)+1:0)+low,4*4096,upper,tables,POOL_PAGES,alias_scratch,64};
+    const uint64_t root=pages_reset(&main_pages,tables,0x10000000);
+    arena=(ArmSmmu4KLiveArena){{bits,output,root,16},
+        (upper?UINT64_MAX-(UINT64_C(1)<<bits)+1:0)+low,4*4096,upper,&main_provider,alias_scratch,64};
     CHECK(ArmSmmu4KLivePrepare(&arena,&state)==ArmSmmu4KSuccess);
-    CHECK(state.prepared && !state.poisoned && !state.tables.leaf_pages && state.tables.table_pages<=POOL_PAGES);
+    /* Only the root exists: every other table is made by the first map that needs it. */
+    CHECK(state.prepared && !state.poisoned && !state.tables.leaf_pages && state.tables.table_pages==1 && main_pages.used==1);
     ArmSmmu4KLiveResult audit;
     CHECK(ArmSmmu4KLiveAudit(&arena,&state,0,0,&audit)==ArmSmmu4KSuccess);
-    CHECK(audit.complete && audit.must_retain_resources && audit.descriptor_reads==state.tables.table_pages*512);
-    for(size_t i=state.tables.table_pages*512;i<POOL_PAGES*512;++i)CHECK(tables[i]==UINT64_C(0xa5a5a5a5a5a5a5a5));
+    CHECK(audit.complete && audit.must_retain_resources && audit.descriptor_reads==512);
+    for(size_t i=512;i<POOL_PAGES*512;++i)CHECK(tables[i]==UINT64_C(0xa5a5a5a5a5a5a5a5));
     context=(ArmSmmu4KContextConfig){upper?0:&arena.config,upper?&arena.config:0,
         upper?0:&state.tables,upper?&state.tables:0,0,0,0x1234,1,1,1,0};
     put32(0x20,1u<<30);put32(0x24,spacing?0x80000002:0x40000010);put32(0x28,0x1555);
@@ -148,8 +181,9 @@ static void complete(unsigned removed,size_t pages)
     else if(removed)CHECK(result.synchronization.tlb_synchronized && (f.page_tlbi_calls?!f.tlbi_calls:f.tlbi_calls==1) &&
         f.sync_calls==1 && f.synced && f.barriers>=2);
     else CHECK(!result.synchronization.tlb_synchronized && !f.tlbi_calls && !f.page_tlbi_calls && !f.sync_calls);
-    /* A whole-region update reads every descriptor; the others read each changed leaf's path before and after the store. */
-    CHECK(result.whole_verification?result.descriptor_reads>=state.tables.table_pages*1024:result.descriptor_reads>=2);
+    /* A whole-region update reads every descriptor of every table; the others read each changed leaf's path before and after the store. */
+    CHECK(result.whole_verification?result.descriptor_reads>=state.tables.table_pages*512:result.descriptor_reads>=2);
+    CHECK(state.tables.table_pages==main_pages.used);
 }
 static unsigned profiles(void)
 {
@@ -161,14 +195,20 @@ static unsigned profiles(void)
         setup(bits,upper,outputs[output],cache,boundary-4096);
         ArmSmmu4KRange r=resource(2,permissions,cache);
         CHECK(update(0,0,&r,1)==ArmSmmu4KSuccess);complete(0,2);
-        CHECK(result.descriptor_writes==2 && result.published_pages==2 && state.generation==1);
+        /* The two pages straddle a table boundary: two leaf tables. Each table made took one link write and two publications (itself
+         * and its parent); each leaf table is published once more after its leaves. */
+        const size_t made=state.tables.table_pages-1;
+        CHECK(result.descriptor_writes==2+made && result.published_pages==2*made+2 && state.generation==1);
         for(unsigned i=0;i<2;++i)CHECK(pte(r.iova+4096*i)==((r.physical+4096*i)|source_permission_pte(permissions,cache)|3));
         CHECK(!pte(r.iova+8192));
         reset_counters();CHECK(update(&r,1,&r,0)==ArmSmmu4KSuccess);complete(1,0);
         CHECK(!pte(r.iova) && !pte(r.iova+4096) && state.generation==2);
         /* Reuse after a completed native invalidation, with different PA. */
         r.physical+=0x10000;reset_counters();
+        /* The unmap kept the tables: the map again makes none and writes the two leaves alone. */
+        const size_t tables_before=state.tables.table_pages;
         CHECK(update(0,0,&r,1)==ArmSmmu4KSuccess);complete(0,2);
+        CHECK(state.tables.table_pages==tables_before && result.descriptor_writes==2 && result.published_pages==2);
         CHECK(pte(r.iova)==(r.physical|source_permission_pte(permissions,cache)|3));
         ++count;
     }
@@ -224,7 +264,7 @@ static unsigned mutations(void)
     memcpy(snapshot,tables,sizeof(tables));ArmSmmu4KRange r=resource(2,3,1);
     unsigned count=0;
     for(size_t index=0;index<slots;++index)for(unsigned bit=0;bit<2;++bit) {
-        memset(&state,0,sizeof(state));
+        memset(&state,0,sizeof(state));main_pages.used=slots/512;
         state.tables=(ArmSmmu4KResult){arena.config.table_physical,0xff44,slots/512,0,0,1};state.prepared=1;
         memcpy(tables,snapshot,sizeof(tables));tables[index]^=UINT64_C(1)<<(bit?53:0);reset_counters();
         CHECK(update(0,0,&r,1)==ArmSmmu4KStateMismatch);
@@ -262,13 +302,13 @@ static void refusals_and_partial(void)
     r=resource(1,3,1);r.iova=UINT64_MAX-4095;
     CHECK(update(0,0,&r,1)==ArmSmmu4KSuccess);complete(0,1);CHECK(pte(r.iova));
     reset_counters();CHECK(update(&r,1,&r,0)==ArmSmmu4KSuccess);complete(1,0);
-    /* Explicit preparation bounds and no writes on malformed/capacity input. */
+    /* Explicit preparation bounds and no writes on malformed input: no provider, a root it never gave, a root that is not empty. */
     setup(48,0,48,0,0x1ff000);memcpy(snapshot,tables,sizeof(tables));
-    ArmSmmu4KLiveState s={0};ArmSmmu4KLiveArena a=arena;a.capacity_pages=1;
-    CHECK(ArmSmmu4KLivePrepare(&a,&s)==ArmSmmu4KCapacity && !s.prepared);
-    a=arena;a.config.leaf_budget=1;CHECK(ArmSmmu4KLivePrepare(&a,&s)==ArmSmmu4KBudget);
-    a=arena;a.mapping=(volatile uint64_t *)(UINTPTR_MAX-4095);
-    CHECK(ArmSmmu4KLivePrepare(&a,&s)==ArmSmmu4KArgument);
+    ArmSmmu4KLiveState s={0};ArmSmmu4KLiveArena a=arena;
+    a.config.leaf_budget=1;CHECK(ArmSmmu4KLivePrepare(&a,&s)==ArmSmmu4KBudget);
+    a=arena;a.pages=0;CHECK(ArmSmmu4KLivePrepare(&a,&s)==ArmSmmu4KArgument);
+    a=arena;a.config.table_physical+=4096;CHECK(ArmSmmu4KLivePrepare(&a,&s)==ArmSmmu4KArgument);
+    tables[3]=1;CHECK(ArmSmmu4KLivePrepare(&arena,&s)==ArmSmmu4KStateMismatch && !s.prepared);tables[3]=snapshot[3];
     CHECK(!memcmp(snapshot,tables,sizeof(tables)));
 }
 static void setup_pair(unsigned bits,unsigned output,unsigned spacing)
@@ -276,8 +316,9 @@ static void setup_pair(unsigned bits,unsigned output,unsigned spacing)
     setup(bits,0,output,spacing,0x1ff000);pair_mode=1;
     memset(&peer_state,0,sizeof(peer_state));
     unsigned peer_bits=80-bits;
-    peer_arena=(ArmSmmu4KLiveArena){{peer_bits,output,0x11000000,16},
-        UINT64_MAX-(UINT64_C(1)<<peer_bits)+1+0x1ff000,4*4096,1,peer_tables,POOL_PAGES,0,0};   /* pairwise alias checks */
+    const uint64_t peer_root=pages_reset(&peer_pages,peer_tables,0x11000000);
+    peer_arena=(ArmSmmu4KLiveArena){{peer_bits,output,peer_root,16},
+        UINT64_MAX-(UINT64_C(1)<<peer_bits)+1+0x1ff000,4*4096,1,&peer_provider,0,0};   /* pairwise alias checks */
     CHECK(!ArmSmmu4KLivePrepare(&peer_arena,&peer_state));
     context.upper=&peer_arena.config;context.upper_tables=&peer_state.tables;
     /* Explicitly reset the HOST REGISTER fixture, never a live hardware bank. */
@@ -360,15 +401,14 @@ static unsigned pair_failures(void)
         CHECK(state.poisoned && peer_state.poisoned && result.must_retain_resources && !result.complete);++controls;
     }
     setup_pair(48,48,0);lo=(ArmSmmu4KLiveRegion){&arena,&state,0,0};hi=(ArmSmmu4KLiveRegion){&peer_arena,&peer_state,0,0};
-    l=resource(2,3,1);ArmSmmu4KRange bad=l;bad.physical=peer_arena.config.table_physical+(POOL_PAGES-1)*4096;
+    /* A range over the other region's table page, and two regions sharing their tables, refuse before any access. */
+    l=resource(2,3,1);ArmSmmu4KRange bad=l;bad.physical=peer_arena.config.table_physical;
     CHECK(pair_update(&lo,&hi,&bad,0,1)==ArmSmmu4KOverlap && !f.calls);++controls;
-    uint64_t old=peer_arena.config.table_physical;peer_arena.config.table_physical=arena.config.table_physical+8*4096;
-    peer_state.tables.root_physical=peer_arena.config.table_physical;
+    const ArmSmmu4KTablePages *own=peer_arena.pages;uint64_t old=peer_arena.config.table_physical;
+    peer_arena.pages=&main_provider;peer_arena.config.table_physical=arena.config.table_physical;
+    peer_state.tables.root_physical=arena.config.table_physical;
     CHECK(pair_update(&lo,&hi,&l,0,1)==ArmSmmu4KOverlap && !f.calls);++controls;
-    peer_arena.config.table_physical=old;peer_state.tables.root_physical=old;
-    peer_arena.mapping=tables+8*512;
-    CHECK(pair_update(&lo,&hi,&l,0,1)==ArmSmmu4KOverlap && !f.calls);++controls;
-    peer_arena.mapping=peer_tables;
+    peer_arena.pages=own;peer_arena.config.table_physical=old;peer_state.tables.root_physical=old;
     CHECK(!pair_update(&lo,&hi,&l,0,1));lo.ranges=&l;lo.count=1;reset_counters();
     bad=l;bad.iova=peer_arena.iova;bad.shareability=2;
     CHECK(pair_update(&lo,&hi,&bad,1,1)==ArmSmmu4KOverlap && !f.calls);++controls;
@@ -404,7 +444,9 @@ static unsigned batches(void)
     CHECK(!f.calls && !state.poisoned && !memcmp(snapshot,tables,sizeof(tables)));
     /* One transaction: four leaves written, two leaf pages published once each, one TLB synchronization. */
     CHECK(batch(0,0,pages,4,1)==ArmSmmu4KSuccess);complete(0,4);
-    CHECK(result.descriptor_writes==4 && result.published_pages==2 && state.generation==1);
+    /* The four leaves span two leaf tables; every table on their paths was made by this map. */
+    {const size_t made=state.tables.table_pages-1;
+    CHECK(result.descriptor_writes==4+made && result.published_pages==2*made+2 && state.generation==1);}
     for(unsigned i=0;i<4;++i)CHECK(pte(pages[i].iova)==(pages[i].physical|source_permission_pte(3,0)|3));
     ++controls;
     /* Any already mapped page refuses the whole batch before MMIO or a store. */
@@ -469,7 +511,9 @@ static unsigned incremental(void)
 {
     unsigned count=0;
     setup(48,1,48,0,0x1ff000);
-    ArmSmmu4KRange r=resource(1,3,1),r2=r;r2.iova+=4096;r2.physical+=0x10000;
+    /* Both pages in one leaf table (the aperture's first page is the last of the 2 MiB below), which r's map makes. */
+    ArmSmmu4KRange r=resource(1,3,1);r.iova+=4096;r.physical+=4096;
+    ArmSmmu4KRange r2=r;r2.iova+=4096;r2.physical+=0x10000;
     CHECK(update(0,0,&r,1)==ArmSmmu4KSuccess && result.whole_verification);
     *leaf_of(r2.iova)=(r2.physical|0x703);reset_counters();
     CHECK(update(&r,1,&r2,1)==ArmSmmu4KStateMismatch && !result.whole_verification);
@@ -488,6 +532,36 @@ static unsigned incremental(void)
     CHECK(update(both,2,&r2,0)==ArmSmmu4KSuccess && !result.whole_verification && !state.poisoned);++count;
     return count;
 }
+/* Tables on demand: a sparse map far apart makes only the tables of its two paths; a provider that refuses ends a map before any leaf
+ * is written, with the region consistent and usable; an unmap keeps the tables and a map again reuses them. */
+static unsigned on_demand(void)
+{
+    unsigned count=0;
+    setup(48,0,48,0,0x1ff000);
+    arena.bytes=(UINT64_C(1)<<47)-0x1ff000;arena.config.leaf_budget=(size_t)(arena.bytes/4096);
+    ArmSmmu4KRange low=resource(1,3,1),high=low;high.iova=(UINT64_C(1)<<46)+0x40000000;high.physical+=0x100000;
+    CHECK(update(0,0,&low,1)==ArmSmmu4KSuccess);complete(0,1);
+    CHECK(state.tables.table_pages==4);++count;   /* root, then one table per level on the path */
+    reset_counters();CHECK(update(&low,1,&high,1)==ArmSmmu4KSuccess);complete(0,2);
+    CHECK(state.tables.table_pages==7 && pte(high.iova) && pte(low.iova));++count;   /* the far path shares only the root */
+    const ArmSmmu4KRange both[2]={low,high};ArmSmmu4KLiveResult audit;
+    CHECK(ArmSmmu4KLiveAudit(&arena,&state,both,2,&audit)==ArmSmmu4KSuccess && audit.descriptor_reads==7*512);++count;
+    /* Refused allocation: no leaf is written, nothing is poisoned, and the map succeeds once tables can be had. */
+    ArmSmmu4KRange third=low;third.iova=(UINT64_C(1)<<45)+0x200000;third.physical+=0x200000;
+    main_pages.refuse_after=1;reset_counters();memcpy(snapshot,tables,sizeof(tables));
+    CHECK(update(both,2,&third,1)==ArmSmmu4KCapacity && !state.poisoned && !result.complete);
+    CHECK(state.tables.table_pages==8 && main_pages.used==8 && !pte(third.iova));
+    CHECK(ArmSmmu4KLiveAudit(&arena,&state,both,2,&audit)==ArmSmmu4KSuccess);++count;
+    main_pages.refuse_after=SIZE_MAX;reset_counters();
+    CHECK(update(both,2,&third,1)==ArmSmmu4KSuccess);complete(0,3);CHECK(pte(third.iova));++count;
+    /* An unmap keeps the tables; the next map over them makes none. */
+    const ArmSmmu4KRange all[3]={low,third,high};
+    reset_counters();CHECK(update(all,3,&third,0)==ArmSmmu4KSuccess);complete(1,2);
+    const size_t kept=state.tables.table_pages;
+    reset_counters();CHECK(update(both,2,&third,1)==ArmSmmu4KSuccess);complete(0,3);
+    CHECK(state.tables.table_pages==kept && result.descriptor_writes==1 && result.published_pages==1);++count;
+    return count;
+}
 int main(void)
 {
     unsigned p=profiles(),fcount=failures(),m=mutations();refusals_and_partial();
@@ -497,4 +571,5 @@ int main(void)
     printf("PASS: %u dual-region native4K profiles and %u dual-region failure/alias/isolation controls, both graphs audited and retained on uncertainty\n",pairs,pair_faults);
     printf("PASS: %u batched scattered-page map/unmap transactions and refusals: one publication per leaf page, a TLB synchronization for each unmap and whole verification\n",batches());
     printf("PASS: %u incremental-verification controls: a changed leaf is proved before and after its store, the whole region on the first update\n",incremental());
+    printf("PASS: %u on-demand table controls: sparse paths across a 48-bit range, refused allocation without a leaf store, tables kept by unmap\n",on_demand());
 }

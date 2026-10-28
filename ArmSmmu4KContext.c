@@ -16,10 +16,11 @@ static int region_valid(const ArmSmmu4KConfig *c,const ArmSmmu4KResult *r,unsign
     if(c->input_bits<32 || c->input_bits>48 || width_code(c->output_bits)<0 ||
         (c->table_physical&4095) || r->root_physical!=c->table_physical ||
         r->mair!=0xff44 || r->upper_region!=upper || !r->table_pages ||
-        r->leaf_pages>c->leaf_budget || r->table_pages>UINT64_MAX/4096 ||
+        r->leaf_pages>c->leaf_budget ||
         r->start_level!=4-(c->input_bits-12+8)/9)return 0;
+    /* The root is one page; the other tables are wherever their region allocated them (ArmSmmu4KLive). */
     uint64_t limit=UINT64_C(1)<<c->output_bits;
-    return r->root_physical<limit && (uint64_t)r->table_pages*4096<=limit-r->root_physical;
+    return r->root_physical<limit;
 }
 ArmSmmu4KStatus ArmSmmu4KEncodeContext(const ArmSmmu4KContextConfig *c,
     ArmSmmu4KContextImage *out)
@@ -38,8 +39,7 @@ ArmSmmu4KStatus ArmSmmu4KEncodeContext(const ArmSmmu4KContextConfig *c,
         (c->upper && (c->upper->input_bits>va || c->upper->output_bits!=basis->output_bits)))return ArmSmmu4KUnsupported;
     if(c->lower && c->upper) {
         const ArmSmmu4KResult *a=c->lower_tables,*b=c->upper_tables;
-        if(a->root_physical<b->root_physical+(uint64_t)b->table_pages*4096 &&
-           b->root_physical<a->root_physical+(uint64_t)a->table_pages*4096)return ArmSmmu4KOverlap;
+        if(a->root_physical==b->root_physical)return ArmSmmu4KOverlap;
     }
     ArmSmmu4KContextImage v;
     v.cbar=0x1f300; /* Stage1 translation, stage2 bypass; weakest bypass attrs. */
