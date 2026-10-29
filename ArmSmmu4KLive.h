@@ -123,9 +123,10 @@ ArmSmmu4KStatus ArmSmmu4KLiveUpdateContextBatch(const ArmSmmu4KIo *,unsigned ban
     const ArmSmmu4KLiveRegion *upper,unsigned change_upper,
     const ArmSmmu4KLiveVisibility *,const ArmSmmu4KRange *changes,size_t change_count,
     unsigned map,unsigned poll_budget,ArmSmmu4KLiveResult *);
-/* UpdateContextBatch for a map whose physical pages the caller owns exclusively: no other range of either region can name them, so
- * the changes are not checked for cache-attribute aliases against the existing ranges (they still are against each other). Every
- * other check stays. Those alias passes walked every existing range per class on each map (i568: 52609 ranges, 0.4 ms a map). */
+/* UpdateContextBatch for a map whose pages the caller has cleared of cache-attribute aliases with every existing range of both
+ * regions: it owns them exclusively, or it checked them against those ranges itself. The changes are not checked against the
+ * existing ranges again (they still are against each other). Every other check stays. Those alias passes walked every existing
+ * range per class on each map (i568: 52609 ranges, 0.4 ms a map). */
 ArmSmmu4KStatus ArmSmmu4KLiveMapContextBatchExclusive(const ArmSmmu4KIo *,unsigned bank,
     const ArmSmmu4KContextConfig *,const ArmSmmu4KLiveRegion *lower,
     const ArmSmmu4KLiveRegion *upper,unsigned change_upper,
