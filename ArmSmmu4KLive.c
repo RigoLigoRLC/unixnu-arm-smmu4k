@@ -288,15 +288,29 @@ static ArmSmmu4KStatus leaf_entry(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState
     *leaf=table;*entry=&table[(va>>12)&511];
     return ArmSmmu4KSuccess;
 }
+/* One pass's last leaf table: the 512 pages of a 2 MiB block share it, so a pass over a change walks from the root once per block, not
+ * once per page (i14aef633e: 2.2 million spans, each walked five times through a binary search of the table pages per level, 4.8 s
+ * of batch maps under the driver's lock). Only a found table is kept; the walk counts its reads as before. */
+struct leaf_cache {uint64_t block;volatile uint64_t *leaf;};
+static ArmSmmu4KStatus leaf_entry_cached(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *state,const ArmSmmu4KLiveVisibility *visibility,
+    uint64_t va,struct leaf_cache *cache,volatile uint64_t **entry,volatile uint64_t **leaf,ArmSmmu4KLiveResult *r)
+{
+    const uint64_t block=(va>>21)+1;
+    if(cache->leaf && cache->block==block) {*leaf=cache->leaf;*entry=&cache->leaf[(va>>12)&511];return ArmSmmu4KSuccess;}
+    ArmSmmu4KStatus status=leaf_entry(a,state,visibility,va,0,entry,leaf,r);
+    if(status==ArmSmmu4KSuccess && *leaf) {cache->block=block;cache->leaf=*leaf;}
+    return status;
+}
 /* The changed leaves alone, through the table path each one's address takes: before the store (after=0) each holds what the
  * operation replaces (nothing for a map, its range's descriptor for an unmap; an absent table holds nothing), after it what the
  * operation wrote. */
 static ArmSmmu4KStatus verify_changed(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *state,const ArmSmmu4KLiveVisibility *visibility,
     const ArmSmmu4KRange *changes,size_t changed,unsigned map,unsigned after,ArmSmmu4KLiveResult *r)
 {
+    struct leaf_cache cache={0,0};
     for(size_t i=0;i<changed;++i)for(uint64_t offset=0;offset<changes[i].bytes;offset+=PAGE) {
         const uint64_t va=changes[i].iova+offset;volatile uint64_t *entry,*leaf;
-        ArmSmmu4KStatus status=leaf_entry(a,state,visibility,va,0,&entry,&leaf,r);if(status!=ArmSmmu4KSuccess)return status;
+        ArmSmmu4KStatus status=leaf_entry_cached(a,state,visibility,va,&cache,&entry,&leaf,r);if(status!=ArmSmmu4KSuccess)return status;
         const uint64_t want=(map==after)?descriptor(&changes[i],va):0;
         ++r->descriptor_reads;
         if((entry?*entry:0)!=want)return ArmSmmu4KStateMismatch;
@@ -511,9 +525,10 @@ static ArmSmmu4KStatus update(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *st
     }
     /* All validation precedes the first leaf store. Caller keeps every master
      * quiesced and retains both old/new object references through this call. */
+    struct leaf_cache stores={0,0},publishes={0,0};
     for(size_t i=0;i<change_count;++i)for(uint64_t offset=0;offset<changes[i].bytes;offset+=PAGE) {
         uint64_t va=changes[i].iova+offset;volatile uint64_t *entry,*leaf;
-        status=leaf_entry(a,state,visibility,va,0,&entry,&leaf,r);if(status!=ArmSmmu4KSuccess)goto poisoned;
+        status=leaf_entry_cached(a,state,visibility,va,&stores,&entry,&leaf,r);if(status!=ArmSmmu4KSuccess)goto poisoned;
         if(!entry) {status=ArmSmmu4KStateMismatch;goto poisoned;}
         *entry=map?descriptor(&changes[i],va):0;++r->descriptor_writes;
     }
@@ -521,7 +536,7 @@ static ArmSmmu4KStatus update(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *st
     const volatile uint64_t *last_leaf=0;
     for(size_t i=0;i<change_count;++i)for(uint64_t offset=0;offset<changes[i].bytes;offset+=PAGE) {
         volatile uint64_t *entry,*leaf;
-        status=leaf_entry(a,state,visibility,changes[i].iova+offset,0,&entry,&leaf,r);if(status!=ArmSmmu4KSuccess)goto poisoned;
+        status=leaf_entry_cached(a,state,visibility,changes[i].iova+offset,&publishes,&entry,&leaf,r);if(status!=ArmSmmu4KSuccess)goto poisoned;
         if(!leaf) {status=ArmSmmu4KStateMismatch;goto poisoned;}
         if(leaf!=last_leaf) {
             if(visibility->publish_table_page(visibility->cookie,leaf,4096)) {status=ArmSmmu4KIoError;goto poisoned;}
