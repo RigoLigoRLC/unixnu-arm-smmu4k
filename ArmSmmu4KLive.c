@@ -421,6 +421,18 @@ ArmSmmu4KStatus ArmSmmu4KLiveAuditContext(const ArmSmmu4KContextConfig *context,
     }
     r->complete=1;return ArmSmmu4KSuccess;
 }
+uint64_t (*arm_smmu_4k_live_now_us)(void);
+volatile uint64_t arm_smmu_4k_live_phase_us[2][8];
+
+static void phase_lap(uint64_t (*now)(void),uint64_t *last,uint64_t *elapsed)
+{
+    if(now) {
+        const uint64_t current=now();
+        *elapsed+=current-*last;
+        *last=current;
+    }
+}
+
 static ArmSmmu4KStatus update(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *state,
     const ArmSmmu4KIo *io,unsigned bank,const ArmSmmu4KContextConfig *context,
     const ArmSmmu4KLiveVisibility *visibility,const ArmSmmu4KRange *before,size_t count,
@@ -429,6 +441,9 @@ static ArmSmmu4KStatus update(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *st
 {
     if(!r)return ArmSmmu4KArgument;
     *r=(ArmSmmu4KLiveResult){0};r->must_retain_resources=1;
+    uint64_t (*now_us)(void)=arm_smmu_4k_live_now_us;
+    const uint64_t began=now_us?now_us():0;
+    uint64_t phase_start=began,phase_us[5]={0};
     if(!state || !state->prepared || state->poisoned || !context || (state->detached && (!state->context_offset || !context->ttbr0_switched)) ||
         !visibility || !visibility->publish_table_page || map>1 || exclusive>map || !change_count ||
         !budget || budget>1048576 || state->generation==UINT64_MAX)return ArmSmmu4KArgument;
@@ -488,6 +503,7 @@ static ArmSmmu4KStatus update(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *st
      * caller observes its routes on its own schedule. After it the bank stays the caller's exclusively owned one; each of these
      * reads is a device register access, and an update observed it five times (int-159: 1.1 ms of a 1.7 ms buffer map). */
     const int observed=!state->detached && (whole || !state->context_offset);
+    phase_lap(now_us,&phase_start,&phase_us[0]);
     if(observed) {
         status=ArmSmmu4KObserveOwnedContext(io,bank,context,&r->synchronization);
         if(status!=ArmSmmu4KSuccess)goto poisoned;
@@ -509,6 +525,7 @@ static ArmSmmu4KStatus update(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *st
             initial.id2!=r->synchronization.id2 || initial.context_offset!=r->synchronization.context_offset)
             {status=ArmSmmu4KStateMismatch;goto poisoned;}
     }
+    phase_lap(now_us,&phase_start,&phase_us[1]);
     /* A map first links every table its leaves need: empty tables, published before they are linked, change no translation. One that
      * cannot be had ends the update here, with no leaf written and the tables made so far kept (they are the state's, counted). The
      * whole-verification update proves them with the rest below. */
@@ -543,6 +560,7 @@ static ArmSmmu4KStatus update(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *st
             ++r->published_pages;last_leaf=leaf;
         }
     }
+    phase_lap(now_us,&phase_start,&phase_us[2]);
     /* A map of leaves that were invalid needs no TLB invalidation: the TLBs hold no translation of an invalid descriptor (as Linux's
      * io-pgtable maps without one). The unmap invalidates the ASID before it reports the translation removed. */
     if(observed) {
@@ -556,6 +574,7 @@ static ArmSmmu4KStatus update(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *st
             ArmSmmu4KSyncContextTlb(io,state->context_offset,context->asid,0,budget,&r->synchronization);
         if(status!=ArmSmmu4KSuccess)goto poisoned;
     }
+    phase_lap(now_us,&phase_start,&phase_us[3]);
     if(whole) {
         status=verify(a,shape,before,count,changes,change_count,map,r);if(status!=ArmSmmu4KSuccess)goto poisoned;
         if(peer) {
@@ -575,6 +594,18 @@ static ArmSmmu4KStatus update(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *st
     }
     state->tables.leaf_pages=map?leaves+changed:leaves-changed;++state->generation;
     r->complete=1;r->translation_removed=!map;r->must_retain_resources=0;
+    phase_lap(now_us,&phase_start,&phase_us[4]);
+    if(now_us) {
+        volatile uint64_t *totals=arm_smmu_4k_live_phase_us[map?0:1];
+        totals[0]=totals[0]+1;
+        for(unsigned i=0;i<5;++i) {
+            totals[i+1]=totals[i+1]+phase_us[i];
+        }
+        if(phase_start-began>totals[6]) {
+            totals[6]=phase_start-began;
+        }
+        totals[7]=totals[7]+changed;
+    }
     return ArmSmmu4KSuccess;
 poisoned:
     state->poisoned=1;if(peer)peer->state->poisoned=1;return status;
@@ -613,3 +644,20 @@ ArmSmmu4KStatus ArmSmmu4KLiveUpdateContext(const ArmSmmu4KIo *io,unsigned bank,
     const ArmSmmu4KLiveRegion *upper,unsigned change_upper,const ArmSmmu4KLiveVisibility *visibility,
     const ArmSmmu4KRange *change,unsigned map,unsigned budget,ArmSmmu4KLiveResult *r)
 {return ArmSmmu4KLiveUpdateContextBatch(io,bank,context,lower,upper,change_upper,visibility,change,1,map,budget,r);}
+
+ArmSmmu4KStatus ArmSmmu4KLiveUpdateContextRanges(const ArmSmmu4KIo *io,unsigned bank,
+    const ArmSmmu4KContextConfig *context,const ArmSmmu4KLiveRegion *lower,
+    const ArmSmmu4KLiveRegion *upper,unsigned change_upper,const ArmSmmu4KLiveVisibility *visibility,
+    const ArmSmmu4KRange *changes,size_t change_count,unsigned map,unsigned budget,ArmSmmu4KLiveResult *r)
+{
+    if(change_upper>1 || map>1 || !(change_upper?upper:lower)) {
+        return ArmSmmu4KArgument;
+    }
+    ArmSmmu4KLiveRegion low=lower?*lower:(ArmSmmu4KLiveRegion){0};
+    ArmSmmu4KLiveRegion high=upper?*upper:(ArmSmmu4KLiveRegion){0};
+    ArmSmmu4KLiveRegion *target=change_upper?&high:&low;
+    target->ranges=map?0:changes;
+    target->count=map?0:change_count;
+    return update_context(io,bank,context,lower?&low:0,upper?&high:0,
+        change_upper,visibility,changes,change_count,map,map,budget,r);
+}

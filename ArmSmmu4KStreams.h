@@ -10,6 +10,7 @@ typedef struct {
     unsigned attempted,attached,poisoned,count,bank;
     uint32_t id0,scr0;
     ArmSmmu4KStream streams[8];
+    ArmSmmu4KShareability stream_shareability; /* Exact S2CR.SHCFG retained through faulting. */
 } ArmSmmu4KStreamState;
 typedef struct {
     unsigned phase,reads,writes,streams_verified,streams_faulted,must_retain_resources;
@@ -18,9 +19,10 @@ typedef struct {
 } ArmSmmu4KStreamResult;
 /* Read-only preflight of global fault policy, target faulting slots and all
  * conflicting live routes, including unrelated SIDs using the selected bank.
- * Intended before programming a disabled context under the same global lease. */
+ * The supplied shareability must match the faulting S2CRs exactly. Intended
+ * before programming a disabled context under the same global lease. */
 ArmSmmu4KStatus ArmSmmu4KCheckFaultedStreams(const ArmSmmu4KIo *,const ArmSmmu4KStream *,
-    unsigned count,unsigned bank,ArmSmmu4KStreamResult *);
+    unsigned count,unsigned bank,ArmSmmu4KShareability,ArmSmmu4KStreamResult *);
 /* Native SMMUv2 exact stream matching (SMS), both legacy and EXIDS layouts.
  * Caller owns the listed slots, bank/ASID, mappings and a global configuration
  * lock. All client masters MUST remain quiesced until successful attachment.

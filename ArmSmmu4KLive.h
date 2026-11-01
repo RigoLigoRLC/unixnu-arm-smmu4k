@@ -132,6 +132,19 @@ ArmSmmu4KStatus ArmSmmu4KLiveMapContextBatchExclusive(const ArmSmmu4KIo *,unsign
     const ArmSmmu4KLiveRegion *upper,unsigned change_upper,
     const ArmSmmu4KLiveVisibility *,const ArmSmmu4KRange *changes,size_t change_count,
     unsigned poll_budget,ArmSmmu4KLiveResult *);
+/* ArmSmmu4KLiveUpdateContextRanges receives one object's retained ranges.
+ * The caller keeps the full mapping set, validates new physical aliases before
+ * map, and serializes updates. Initial empty tables are audited by attach;
+ * each update checks actual old and new leaves and retains their counts.
+ * Unmap supplies exactly the ranges installed for that object. Detached
+ * process tables retain their ASID and the owned context bank's offset. */
+ArmSmmu4KStatus ArmSmmu4KLiveUpdateContextRanges(const ArmSmmu4KIo *,unsigned bank,
+    const ArmSmmu4KContextConfig *,const ArmSmmu4KLiveRegion *lower,
+    const ArmSmmu4KLiveRegion *upper,unsigned change_upper,
+    const ArmSmmu4KLiveVisibility *,const ArmSmmu4KRange *changes,size_t change_count,
+    unsigned map,unsigned poll_budget,ArmSmmu4KLiveResult *);
+extern uint64_t (*arm_smmu_4k_live_now_us)(void);
+extern volatile uint64_t arm_smmu_4k_live_phase_us[2][8];
 #ifdef __cplusplus
 }
 #endif

@@ -5,6 +5,12 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+/* ArmSmmu4KShareability selects the SMMUv2 SHCFG transaction override. */
+typedef enum {
+    ArmSmmu4KShareabilityFromTransaction = 0,
+    ArmSmmu4KShareabilityNonShareable = 3
+} ArmSmmu4KShareability;
+
 typedef struct {
     /* A config/result pair from Build, BuildUpper or LivePrepare; NULL pair disables it.
      * A live arena may have zero mapped leaves while retaining its table topology.
@@ -14,12 +20,14 @@ typedef struct {
     const ArmSmmu4KResult *lower_tables, *upper_tables;
     uint32_t id0, id2;       /* Raw SMMUv2 identification register values. */
     unsigned asid;          /* 0..65535, ownership managed by the caller. */
-    unsigned coherent_walk; /* Explicit: 1=inner WBWA, 0=outer NC. */
+    unsigned coherent_walk; /* Outer-shareable table walks: 1=WBWA, 0=NC. */
     unsigned stall_on_fault, continue_after_fault; /* Each 0 or 1. */
     /* 1: the bank's TTBR0 is switched among several lower-region tables, each with its own ASID (one table per GPU process, set by
      * ArmSmmu4KWriteContextTtbr0 or by the device itself): a readback then holds whichever table is installed, so TTBR0 and, with no
      * upper region, TTBR1 (the ASID alone) are not compared; every other register still is. 0 keeps the exact comparison. */
     unsigned ttbr0_switched;
+    ArmSmmu4KShareability stream_shareability; /* S2CR.SHCFG for each owned stream. */
+    ArmSmmu4KShareability bypass_shareability; /* SCTLR.SHCFG for bypass transactions. */
 } ArmSmmu4KContextConfig;
 typedef struct {
     uint32_t cbar, cba2r, tcr, tcr2, mair0, mair1, sctlr, reserved_zero;

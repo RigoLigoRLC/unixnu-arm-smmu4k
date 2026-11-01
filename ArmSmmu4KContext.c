@@ -31,7 +31,13 @@ ArmSmmu4KStatus ArmSmmu4KEncodeContext(const ArmSmmu4KContextConfig *c,
     out->ttbr0=out->ttbr1=0;
     if(!c || (!c->lower && !c->upper) || c->asid>65535 || c->coherent_walk>1 ||
         c->stall_on_fault>1 || c->continue_after_fault>1 ||
-        !region_valid(c->lower,c->lower_tables,0) || !region_valid(c->upper,c->upper_tables,1))return ArmSmmu4KArgument;
+        (c->stream_shareability!=ArmSmmu4KShareabilityFromTransaction &&
+            c->stream_shareability!=ArmSmmu4KShareabilityNonShareable) ||
+        (c->bypass_shareability!=ArmSmmu4KShareabilityFromTransaction &&
+            c->bypass_shareability!=ArmSmmu4KShareabilityNonShareable) ||
+        !region_valid(c->lower,c->lower_tables,0) || !region_valid(c->upper,c->upper_tables,1)) {
+        return ArmSmmu4KArgument;
+    }
     unsigned va=width_bits((c->id2>>8)&15),pa=width_bits((c->id2>>4)&15);
     if(!(c->id0&(UINT32_C(1)<<30)) || !(c->id2&(1u<<12)) || !va || !pa)return ArmSmmu4KUnsupported;
     const ArmSmmu4KConfig *basis=c->lower?c->lower:c->upper;
@@ -45,7 +51,7 @@ ArmSmmu4KStatus ArmSmmu4KEncodeContext(const ArmSmmu4KContextConfig *c,
     v.cbar=0x1f300; /* Stage1 translation, stage2 bypass; weakest bypass attrs. */
     v.cba2r=1;      /* AArch64. No stage2 VMID or guest translation. */
     v.tcr=UINT32_C(2)<<30; /* TG1=4K, TG0=4K. */
-    unsigned walk=c->coherent_walk?0x3500:0x2000;
+    unsigned walk=c->coherent_walk?0x2500:0x2000;
     if(c->lower)v.tcr|=walk|(64-c->lower->input_bits);
     else v.tcr|=1u<<7; /* EPD0 */
     if(c->upper)v.tcr|=(walk|(64-c->upper->input_bits))<<16;
@@ -55,7 +61,8 @@ ArmSmmu4KStatus ArmSmmu4KEncodeContext(const ArmSmmu4KContextConfig *c,
     if(c->lower)v.ttbr0|=c->lower_tables->root_physical;
     if(c->upper)v.ttbr1|=c->upper_tables->root_physical;
     v.mair0=0xff44;v.mair1=0;
-    v.sctlr=0x1067|(c->stall_on_fault<<7)|(c->continue_after_fault<<8);
+    v.sctlr=0x1067|(c->stall_on_fault<<7)|(c->continue_after_fault<<8)|
+        ((uint32_t)c->bypass_shareability<<22);
     v.reserved_zero=0;
     *out=v;
     return ArmSmmu4KSuccess;
